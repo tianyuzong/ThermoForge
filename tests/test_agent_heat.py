@@ -49,17 +49,17 @@ def test_selection_excludes_cavity_faces(model):
     assert not set(top).intersection(selections['all_outer']['faces'])
 
 
-def test_prompt_for_empty_configuration_has_selectors_and_requires_heat(model):
+def test_skill_prompt_has_rule_candidate_and_omits_raw_face_lists(model):
     model_id, _, _ = model
     prompt = agent._codex_prompt(model_id, '顶部20W热源，全部外表面对流', Simulation(model_id=model_id).model_dump())
     payload = json.loads(prompt.split('输入数据：\n',1)[1])
-    top = next(patch for patch in payload['geometry']['surface_selections'] if patch['id']=='top')
+    top = payload['available_selections']['top']
     assert top['face_count'] == 2
     assert 'faces' not in top
-    schema = payload['simulation_schema']
-    assert schema['properties']['heat_sources']['minItems'] == 1
-    assert 'heat_sources' in schema['required']
-    assert 'surface_selection' in schema['$defs']['Heat']['properties']
+    heat = payload['candidate']['heat_sources'][0]
+    assert heat['power_W'] == 20 and heat['surface_selection'] == 'top'
+    assert 'faces' not in heat
+    assert 'simulation_schema' not in payload
 
 
 def test_new_heat_and_cooling_resolve_separately_from_empty_config(model):

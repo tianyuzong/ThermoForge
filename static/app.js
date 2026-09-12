@@ -134,7 +134,8 @@ $('agent-mode').onchange=refreshAgentModeHint;
     if(cfg.model_id!==requestConfig.model_id)throw new Error('生成期间已切换模型，请为当前模型重新生成配置。');
     const questions=plan.questions||[];
     $('agent-plan-box').hidden=false;
-    $('agent-plan-mode').textContent=' · '+(agentModeLabels[mode]||mode);
+    const detailLabel=(agentModeLabels[mode]||mode)+(plan.workflow==='thermal-config'?' · 配置 Skill':'')+(Number.isFinite(plan.metrics?.elapsed_s)?' · '+plan.metrics.elapsed_s.toFixed(1)+' 秒':'');
+    $('agent-plan-mode').textContent=' · '+detailLabel;
     if(!plan.ok){
       const detail=questions.join('\n')||'配置生成失败，请重试。';
       agentTraceSet(0,'error',detail);
@@ -146,7 +147,7 @@ $('agent-mode').onchange=refreshAgentModeHint;
     if(!plan.config?.heat_sources?.length)throw new Error('Agent 草案没有生成热源。请重新生成或手动添加热源；本次不能确认运行。');
     if(plan.config.model_id!==requestConfig.model_id)throw new Error('Agent 草案属于其他模型，请为当前模型重新生成。');
     agentConfig=plan.config;
-    agentTraceSet(0,'done','已收到配置 · '+(agentModeLabels[mode]||mode));
+    agentTraceSet(0,'done','已收到配置 · '+detailLabel);
     agentTraceSet(1,'done','模型 '+model.name+' · 请核对热源选区');
     agentTraceSet(2,'done',(plan.changes||[]).join(' · ')||'保持当前参数');
     agentTraceSet(3,'done',questions.join(' ')||'配置结构校验通过，请核对参数后确认');

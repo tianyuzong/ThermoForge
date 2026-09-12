@@ -50,13 +50,15 @@ test('timeout keeps current configuration and disables any previous draft', asyn
 
 test('successful generation presents a draft without applying or simulating it', async () => {
   const draft = {model_id: 'model-1', duration_s: 600, heat_sources: [{power_W:20, faces:[1]}]};
-  const p = page(async () => ({ok: true, config: draft, changes: ['时长 600 秒']}));
+  const p = page(async () => ({ok: true, config: draft, changes: ['时长 600 秒'], workflow:'thermal-config', metrics:{elapsed_s:12.3}}));
   await p.element('agent-plan').onclick();
   assert.deepEqual(p.context.cfg, p.original);
   assert.deepEqual(p.context.agentConfig, draft);
   assert.equal(p.element('agent-confirm').disabled, false);
   assert.equal(p.element('agent-apply').disabled, false);
   assert.equal(p.element('agent-plan').disabled, false);
+  assert.match(p.element('agent-plan-mode').textContent, /配置 Skill/);
+  assert.match(p.element('agent-plan-mode').textContent, /12\.3 秒/);
   assert.equal(p.timers.size, 0);
 });
 

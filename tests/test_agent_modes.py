@@ -5,9 +5,19 @@ import subprocess
 from types import SimpleNamespace
 
 import agent
+import agent_skill
 
 from agent import _cli_response_text, _json_from_text, _response_text, codex_plan_request
-from schemas import AgentRequest
+from schemas import AgentRequest, Simulation
+
+
+@pytest.fixture
+def prepared_cli(monkeypatch):
+    def prepare(engine, model_id, prompt, current):
+        original = Simulation(model_id=model_id, **{k:v for k,v in current.items() if k != 'model_id'}).model_dump()
+        return dict(model_id=model_id, original=original, candidate=original, warnings=[], public={},
+                    selectors={'top': {'faces':[0], 'face_count':1}})
+    monkeypatch.setattr(agent_skill, 'prepare', prepare)
 
 
 def test_agent_request_mode_defaults_to_local():
@@ -77,7 +87,7 @@ def test_cli_rejects_invalid_timeout(monkeypatch, raw):
         agent._codex_cli_timeout()
 
 
-def test_cli_timeout_reports_upstream_failure_and_keeps_config(monkeypatch):
+def test_cli_timeout_reports_upstream_failure_and_keeps_config(monkeypatch, prepared_cli):
     monkeypatch.setattr(agent, '_codex_prompt', lambda *args: 'test prompt')
     monkeypatch.setenv('THERMAL_CODEX_TIMEOUT_S', '180')
     current = {'model_id': 'x', 'duration_s': 60}
@@ -96,7 +106,7 @@ def test_cli_timeout_reports_upstream_failure_and_keeps_config(monkeypatch):
     assert 'request timed out' in result['diagnostic']
 
 
-def test_cli_startup_error_is_distinct(monkeypatch):
+def test_cli_startup_error_is_distinct(monkeypatch, prepared_cli):
     monkeypatch.setattr(agent, '_codex_prompt', lambda *args: 'test prompt')
     def missing(*args, **kwargs):
         raise FileNotFoundError('Executable not found')
@@ -105,15 +115,25 @@ def test_cli_startup_error_is_distinct(monkeypatch):
     assert result['error_code'] == 'startup'
 
 
-def test_cli_success_still_returns_validated_config(monkeypatch):
+def test_cli_success_still_returns_validated_config(monkeypatch, prepared_cli):
     monkeypatch.setattr(agent, '_codex_prompt', lambda *args: 'test prompt')
     monkeypatch.setattr(agent, 'read_json', lambda path: {'triangles': 12})
-    event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '{"model_id":"x","duration_s":600,"heat_sources":[{"power_W":20,"faces":[0]}]}'}}
-    monkeypatch.setattr(agent.subprocess, 'run', lambda *args, **kwargs:
-                        SimpleNamespace(returncode=0, stdout=json.dumps(event), stderr=''))
+    review = dict(patch=[dict(path='/duration_s',value_json='600'),
+                        dict(path='/heat_sources',value_json='[{"power_W":20,"surface_selection":"top"}]')], questions=[])
+    event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(review)}}
+    def run(args, **kwargs):
+        assert '--output-schema' in args
+        assert args[args.index('--sandbox')+1] == 'read-only'
+        assert '--disable' in args and 'shell_tool' in args and 'apps' in args
+        schema = json.loads(open(args[args.index('--output-schema')+1],encoding='utf-8').read())
+        assert schema['additionalProperties'] is False
+        return SimpleNamespace(returncode=0, stdout=json.dumps(event), stderr='')
+    monkeypatch.setattr(agent.subprocess, 'run', run)
     result = agent._codex_cli_plan_request('x', 'test', {}, 'codex.exe')
     assert result['ok']
     assert result['config']['duration_s'] == 600
+    assert result['workflow'] == 'thermal-config'
+    assert result['metrics']['tool_calls'] == 0
 
 
 def test_cli_diagnostics_redact_credentials():

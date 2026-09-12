@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -44,84 +45,37 @@ def _display_surface(model_id):
 
 
 def _face_selection(model_id, text, triangles):
-    lower = text.lower()
-    # A heat source phrased as "在组件 9 施加" should target that
-    # component's exterior faces, even when the user does not also say
-    # "整个外表面".  Material assignments may mention several component
-    # numbers, so only use a component preceded by an explicit target word.
-    target = re.search(r'(?:在|给|对)\s*(?:组件|部件)\s*(\d+)', text)
-    if not target:
-        target = re.search(r'(?:组件|部件)\s*(\d+)\s*(?:的)?\s*(?:外表面|表面)', text)
-    if target:
-        component_id = int(target.group(1)) - 1
-        metadata = read_json(MODELS / model_id / 'metadata.json')
-        components = metadata.get('components') or []
-        record = next((item for item in components if int(item.get('component_id', -1)) == component_id), None)
-        if record:
-            display = read_json(MODELS / model_id / 'display.json')
-            points = np.asarray(display['points'], dtype=float).reshape(-1, 3)
-            faces = np.asarray(display['faces'], dtype=np.int64).reshape(-1, 3)
-            centers = points[faces].mean(axis=1)
-            low = np.asarray(record['bounds_m'][0], dtype=float)
-            high = np.asarray(record['bounds_m'][1], dtype=float)
-            tolerance = max(float(np.ptp(points, axis=0).max()) * 1e-8, 1e-9)
-            selected = np.all((centers >= low - tolerance) & (centers <= high + tolerance), axis=1)
-            outer = np.asarray(display.get('is_outer', np.ones(len(centers))), dtype=bool)
-            if len(outer) == len(selected):
-                selected &= outer
-            indices = np.flatnonzero(selected).tolist()
-            if indices:
-                return indices, f'已自动选择组件 {component_id + 1} 外表面 ({len(indices)} 个三角面)'
-    if re.search(r'整个外表面|全部外表面|所有表面|全表面', text, re.I):
-        return list(range(triangles)), '已自动选择全部外表面'
-
-    direction = None
-    label = None
-    for token, axis in (('+x', (0, 1)), ('-x', (0, -1)), ('+y', (1, 1)), ('-y', (1, -1)), ('+z', (2, 1)), ('-z', (2, -1))):
-        if token in lower or re.search(rf'{axis[0] + 1}\s*轴\s*{("正" if axis[1] > 0 else "负")}', text):
-            direction, label = axis, token
-            break
-    if direction is None:
-        for pattern, axis, name in (
-            (r'左(?:侧|边)?', (0, -1), '左侧 (-X)'),
-            (r'右(?:侧|边)?', (0, 1), '右侧 (+X)'),
-            (r'前(?:侧|面|方)', (1, -1), '前侧 (-Y)'),
-            (r'后(?:侧|面|方)', (1, 1), '后侧 (+Y)'),
-            (r'(?:底部|下方|下表面)', (2, -1), '底部 (-Z)'),
-            (r'(?:顶部|上方|上表面)', (2, 1), '顶部 (+Z)'),
-        ):
-            if re.search(pattern, text):
-                direction, label = axis, name
-                break
-
-    coordinate = re.search(r'\b([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)', text, re.I)
-    if direction is None and coordinate:
-        axis = 'xyz'.index(coordinate.group(1).lower())
-        value = float(coordinate.group(2))
-        unit = coordinate.group(3).lower()
-        value *= .001 if unit in ('mm', '毫米') else .01 if unit in ('cm', '厘米') else 1
-        centers, _ = _display_surface(model_id)
-        distance = np.abs(centers[:, axis] - value)
-        span = max(float(np.ptp(centers[:, axis])), 1e-12)
-        if float(distance.min()) > span * .03:
-            return None, None
-        selected = np.flatnonzero(distance <= max(float(distance.min()) * 1.05, span * .03)).tolist()
-        if not selected:
-            selected = [int(distance.argmin())]
-        return selected, f'已自动选择 {coordinate.group(1).upper()}={value:g} m 附近外表面 ({len(selected)} 个三角面)'
-    if direction is None:
+    selector = _selection_from_text(text)
+    if selector is None:
         return None, None
+    selections = _surface_selections(model_id, [selector])
+    chosen = selections.get(selector)
+    if not chosen or not chosen['faces']:
+        raise ValueError(f'当前模型没有可用的“{selector}”外表面，请手动刷选或更改选区。')
+    return chosen['faces'], f'已选择 {chosen["name"]}（{chosen["face_count"]} 个三角面）'
 
-    centers, normals = _display_surface(model_id)
-    axis, sign = direction
-    edge = centers[:, axis].max() if sign > 0 else centers[:, axis].min()
-    span = max(float(centers[:, axis].max() - centers[:, axis].min()), 1e-12)
-    at_edge = np.abs(centers[:, axis] - edge) <= span * .03
-    facing = normals[:, axis] * sign > .35
-    selected = np.flatnonzero(at_edge & facing).tolist()
-    if not selected:
-        selected = np.flatnonzero(at_edge).tolist()
-    return selected, f'已自动选择 {label} 外表面 ({len(selected)} 个三角面)'
+
+def _selection_from_text(text):
+    lower = text.lower()
+    component = re.search(r'(?:组件|部件)\s*(\d+)', text)
+    coordinate = re.search(r'(?<![A-Za-z])([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)', text, re.I)
+    directions = [
+        (r'\+z|顶部|上表面|上方', 'top'), (r'-z|底部|下表面|下方', 'bottom'),
+        (r'\+x|右侧|右边', 'right'), (r'-x|左侧|左边', 'left'),
+        (r'\+y|后侧|后面|后方', 'back'), (r'-y|前侧|前面|前方', 'front'),
+    ]
+    side = next((value for pattern, value in directions if re.search(pattern, lower)), None)
+    if component:
+        return f'component:{int(component.group(1))}' + (f':{side}' if side else '')
+    if coordinate and not side:
+        axis, value, unit = coordinate.groups()
+        value = float(value) * (.001 if unit.lower() in ('mm', '毫米') else .01 if unit.lower() in ('cm', '厘米') else 1)
+        return f'{axis.lower()}={value:g}'
+    if side:
+        return side
+    if re.search(r'整个外表面|全部外表面|所有表面|全表面', text, re.I):
+        return 'all_outer'
+    return None
 
 
 def _position_from_prompt(model_id, text, faces=None):
@@ -129,7 +83,7 @@ def _position_from_prompt(model_id, text, faces=None):
     lo=np.asarray(model['bounds_m'][0],dtype=float);hi=np.asarray(model['bounds_m'][1],dtype=float)
     position=(lo+hi)/2
     found=False
-    for match in re.finditer(r'\b([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)',text,re.I):
+    for match in re.finditer(r'(?<![A-Za-z])([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)',text,re.I):
         axis='xyz'.index(match.group(1).lower());value=float(match.group(2));unit=match.group(3).lower()
         position[axis]=value*(.001 if unit in ('mm','毫米') else .01 if unit in ('cm','厘米') else 1);found=True
     if found:return position.tolist()
@@ -141,127 +95,9 @@ def _position_from_prompt(model_id, text, faces=None):
 
 
 def make_plan(model_id, prompt, current):
-    model = read_json(MODELS / model_id / 'metadata.json')
-    cfg = copy.deepcopy(current or {})
-    cfg['model_id'] = model_id
-    changes, warnings, questions = [], [], []
-
-    material = None
-    aliases = (
-        ('不锈钢|stainless', '不锈钢（示例）'),
-        ('碳钢|steel', '碳钢（示例）'),
-        ('铝|alum|aluminium', '铝（示例）'),
-        ('铜|copper', '铜 C11000'),
-        ('铁|iron', '铁（示例）'),
-    )
-    for pattern, name in aliases:
-        if re.search(pattern, prompt, re.I):
-            material = next(item for item in PRESETS if item['name'] == name)
-            break
-    if material:
-        cfg['base_material'] = copy.deepcopy(material)
-        changes.append(f'基础材料: {material["name"]}')
-
-    component_aliases=(
-        ('不锈钢|stainless','不锈钢（示例）'),('碳钢|steel','碳钢（示例）'),
-        ('铝|alum|aluminium','铝（示例）'),('铜|copper','铜 C11000'),('铁|iron','铁（示例）'))
-    assignments=[]
-    for match in re.finditer(r'(?:组件|部件)\s*(\d+)[^，,。;；\n]{0,24}?(不锈钢|stainless|碳钢|steel|铝|alum|aluminium|铜|copper|铁|iron)',prompt,re.I):
-        component_id=int(match.group(1))-1
-        if component_id<0: continue
-        material_name=next((name for pattern,name in component_aliases if re.fullmatch(pattern,match.group(2),re.I)),None)
-        if material_name:
-            preset=next(item for item in PRESETS if item['name']==material_name)
-            assignments.append(dict(component_id=component_id,material=copy.deepcopy(preset)))
-            changes.append(f'组件 {component_id+1} 材料: {material_name}')
-    if assignments: cfg['component_materials']=assignments
-
-    if re.search(r'稳态|steady|最终稳定', prompt, re.I):
-        cfg['analysis_mode'] = 'steady'
-        changes.append('分析类型: 稳态导热')
-    elif re.search(r'瞬态|transient|升温|降温|冷却过程', prompt, re.I):
-        cfg['analysis_mode'] = 'transient'
-        changes.append('分析类型: 瞬态导热')
-
-    source_type='point' if re.search(r'点热源|点源|point',prompt,re.I) else 'surface'
-    placement='embedded' if re.search(r'嵌入|内部|embedded',prompt,re.I) else 'external' if re.search(r'外部|外置|external',prompt,re.I) else 'surface'
-
-    power = _number(prompt, r'(?:功率|加热|热源)?\s*(\d+(?:\.\d+)?)\s*(kW|千瓦|W|瓦)')
-    if power is not None:
-        unit = re.search(r'(kW|千瓦|W|瓦)', prompt[re.search(r'(?:功率|加热|热源)?\s*\d+(?:\.\d+)?\s*(kW|千瓦|W|瓦)', prompt, re.I).start():], re.I).group(1).lower()
-        power *= 1000 if unit in ('kw', '千瓦') else 1
-        cfg.setdefault('heat_sources', [])
-        source = copy.deepcopy(cfg['heat_sources'][0]) if cfg['heat_sources'] else dict(name='智能热源', power_W=power, start_s=0, end_s=cfg.get('duration_s', 3600), faces=[])
-        source.update(source_type=source_type, placement=placement, power_W=power, end_s=cfg.get('duration_s', 3600))
-        cfg['heat_sources'] = [source] + cfg['heat_sources'][1:]
-        changes.append(f'热源功率: {power:g} W')
-
-    duration = _duration(prompt)
-    if duration is not None:
-        cfg['duration_s'] = duration
-        for source in cfg.get('heat_sources', []):
-            if source.get('end_s', 0) >= cfg.get('duration_s', duration):
-                source['end_s'] = duration
-        changes.append(f'仿真时长: {duration:g} s')
-
-    for key, label, pattern in (
-        ('initial_C', '初始温度', r'(?:初始|起始)温度?\s*(?:为|=|:)?\s*(-?\d+(?:\.\d+)?)\s*°?C'),
-        ('ambient_C', '环境温度', r'(?:环境|室温)温度?\s*(?:为|=|:)?\s*(-?\d+(?:\.\d+)?)\s*°?C'),
-        ('default_h', '换热系数', r'(?:换热系数|对流系数|h)\s*(?:为|=|:)?\s*(\d+(?:\.\d+)?)'),
-        ('mesh_size_m', '网格尺寸', r'(?:网格(?:尺寸|大小)?|mesh)\s*(?:为|=|:)?\s*(\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)'),
-        ('dt_s', '计算步长', r'(?:计算|时间)?步长\s*(?:为|=|:)?\s*(\d+(?:\.\d+)?)\s*(秒|s)'),
-        ('save_s', '保存间隔', r'(?:保存|输出)(?:间隔)?\s*(?:为|=|:)?\s*(\d+(?:\.\d+)?)\s*(秒|s)'),
-    ):
-        value = _number(prompt, pattern)
-        if value is None:
-            continue
-        match = re.search(pattern, prompt, re.I)
-        unit = match.group(2).lower() if match and match.lastindex and match.lastindex >= 2 else ''
-        if key == 'mesh_size_m':
-            value *= .001 if unit in ('mm', '毫米') else .01 if unit in ('cm', '厘米') else 1
-        cfg[key] = value
-        changes.append(f'{label}: {value:g} ' + ('m' if key == 'mesh_size_m' else ''))
-
-    if re.search(r'辐射|radiation', prompt, re.I):
-        cfg['radiation_enabled'] = True
-        changes.append('启用表面辐射')
-    if re.search(r'对流|换热|散热', prompt, re.I):
-        cfg['heat_convection'] = True
-        changes.append('热源表面启用默认对流散热')
-
-    faces, face_note = _face_selection(model_id, prompt, int(model['triangles']))
-    if face_note:
-        if cfg.get('heat_sources'):
-            source=cfg['heat_sources'][0]
-            if source.get('source_type','surface')=='point':
-                source['faces']=[]
-                source['position_m']=_position_from_prompt(model_id,prompt,faces)
-            else:
-                source['faces'] = faces
-        changes.append(face_note)
-    if cfg.get('heat_sources'):
-        source=cfg['heat_sources'][0]
-        source.setdefault('source_type',source_type);source.setdefault('placement',placement)
-        if source.get('source_type')=='point' or source.get('placement')=='embedded':
-            source['position_m']=source.get('position_m') or _position_from_prompt(model_id,prompt,faces)
-            source.setdefault('radius_m',max(model['dimensions_m'])/30)
-    minimum_mesh=max(model['dimensions_m'])/130
-    recommended_mesh=max(max(model['dimensions_m'])/30,minimum_mesh)
-    if cfg.get('mesh_size_m',.035)<recommended_mesh:
-        cfg['mesh_size_m']=recommended_mesh
-        warnings.append(f'目标网格对当前模型过细，已按可运行规模调整为 {recommended_mesh*1000:.2f} mm；如需更细网格请缩短时长或增大保存间隔。')
-    if cfg.get('heat_sources') and cfg['heat_sources'][0].get('source_type','surface')=='surface' and cfg['heat_sources'][0].get('placement','surface')!='embedded' and not cfg['heat_sources'][0].get('faces'):
-        questions.append('请指定受热面：可在三维视图刷选，或在描述中写“整个外表面”“左侧/顶部”或“x=10 mm”。')
-    if not cfg.get('heat_sources') and power is None:
-        questions.append('草案缺少热源：请明确热源功率与受热面，或点热源位置，再生成配置。')
-    if cfg.get('duration_s', 3600) / max(cfg.get('save_s', 15), 1) > 300:
-        warnings.append('保存帧数超过 301，已建议把保存间隔调大。')
-    try:
-        validated = Simulation.model_validate(cfg)
-    except Exception as error:
-        questions.append('参数组合需要调整：' + str(error).split('\n')[0])
-        return dict(ok=False, config=cfg, changes=changes, warnings=warnings, questions=questions)
-    return dict(ok=not questions, config=validated.model_dump(mode='json'), changes=changes, warnings=warnings, questions=questions)
+    from agent_rules import make_plan as extract_rules
+    import sys
+    return extract_rules(sys.modules[__name__], model_id, prompt, current)
 
 
 def plan_request(model_id, prompt, current):
@@ -298,14 +134,10 @@ def _json_from_text(text):
         raise
 
 
-def _surface_selections(model_id):
-    """Resolve named exterior patches to actual imported display-face IDs.
-
-    Axis patches use exterior triangle centroids in the outermost 3% of that
-    axis, with normals facing the requested direction. No guessed face IDs or
-    fallback to the entire surface is used for an unavailable patch.
-    """
-    display = read_json(MODELS / model_id / 'display.json')
+def _surface_selections(model_id, requested=()):
+    """Resolve shared semantic selectors without asking a model to invent IDs."""
+    folder = MODELS / model_id
+    display = read_json(folder / 'display.json')
     points = np.asarray(display['points'], dtype=float).reshape(-1, 3)
     faces = np.asarray(display['faces'], dtype=np.int64).reshape(-1, 3)
     tri = points[faces]
@@ -322,20 +154,77 @@ def _surface_selections(model_id):
         selections[key] = dict(name=name, faces=ids, face_count=len(ids),
                                area_m2=float(lengths[mask].sum() / 2))
 
+    def directions(prefix, label, mask):
+        for key, name, axis, sign in (
+            ('top', '顶部 (+Z)', 2, 1), ('bottom', '底部 (-Z)', 2, -1),
+            ('right', '右侧 (+X)', 0, 1), ('left', '左侧 (-X)', 0, -1),
+            ('back', '后侧 (+Y)', 1, 1), ('front', '前侧 (-Y)', 1, -1),
+        ):
+            selected = np.zeros(len(faces), dtype=bool)
+            if np.any(mask):
+                values = centers[mask, axis]
+                edge = values.max() if sign > 0 else values.min()
+                tolerance = max(float(np.ptp(values)) * .03, 1e-10)
+                selected = mask & (np.abs(centers[:, axis] - edge) <= tolerance) & (normals[:, axis] * sign > .35)
+            add(prefix + key, label + name, selected)
+
     add('all_outer', '全部外表面', valid)
-    for key, name, axis, sign in (
-        ('top', '顶部 (+Z)', 2, 1), ('bottom', '底部 (-Z)', 2, -1),
-        ('right', '右侧 (+X)', 0, 1), ('left', '左侧 (-X)', 0, -1),
-        ('back', '后侧 (+Y)', 1, 1), ('front', '前侧 (-Y)', 1, -1),
-    ):
-        mask = np.zeros(len(faces), dtype=bool)
-        if np.any(valid):
-            values = centers[valid, axis]
-            edge = values.max() if sign > 0 else values.min()
-            tolerance = max(float(np.ptp(values)) * .03, 1e-10)
-            mask = valid & (np.abs(centers[:, axis] - edge) <= tolerance) & (normals[:, axis] * sign > .35)
-        add(key, name, mask)
+    directions('', '', valid)
+    metadata = read_json(folder / 'metadata.json')
+    shell_path = folder / 'shells.npz'
+    shell_ids = None
+    if shell_path.is_file():
+        with np.load(shell_path) as data:
+            shell_ids = data['shell_id'].copy()
+        if len(shell_ids) != len(faces):
+            shell_ids = None
+    for record in metadata.get('components', []):
+        index = int(record['component_id'])
+        if shell_ids is not None:
+            mask = valid & (shell_ids == index)
+        elif record.get('bounds_m'):
+            low, high = np.asarray(record['bounds_m'], dtype=float)
+            epsilon = max(float(np.ptp(points, axis=0).max()) * 1e-8, 1e-10)
+            mask = valid & np.all((centers >= low-epsilon) & (centers <= high+epsilon), axis=1)
+        else:
+            continue
+        key = f'component:{index+1}'
+        add(key, f'组件 {index+1} 外表面', mask)
+        directions(key + ':', f'组件 {index+1} ', mask)
+    for selector in requested:
+        match = re.fullmatch(r'([xyz])=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', selector or '')
+        if not match:
+            continue
+        axis = 'xyz'.index(match.group(1))
+        value = float(match.group(2))
+        tolerance = max(float(np.ptp(centers[valid, axis])) * .03, 1e-10) if np.any(valid) else 1e-10
+        add(selector, f'{match.group(1).upper()}={value:g} m 附近外表面',
+            valid & (np.abs(centers[:, axis] - value) <= tolerance))
     return selections
+
+
+def _requested_selections(prompt):
+    tokens = []
+    for match in re.finditer(r'(?<![A-Za-z])[xyz]\s*(?:=|为|在)\s*-?\d+(?:\.\d+)?\s*(?:mm|毫米|cm|厘米|m|米)', prompt, re.I):
+        token = _selection_from_text(match.group())
+        if token:
+            tokens.append(token)
+    return tokens
+
+
+def _validate_geometry(model_id, config):
+    metadata = read_json(MODELS / model_id / 'metadata.json')
+    for group in [*config.get('heat_sources', []), *config.get('cooling', [])]:
+        if group.get('faces') and max(group['faces']) >= metadata['triangles']:
+            raise ValueError('Agent 返回了当前模型不存在的面编号，请重新选取。')
+        if group.get('placement') == 'embedded' and group.get('position_m') and metadata.get('bounds_m'):
+            low, high = np.asarray(metadata['bounds_m'])
+            position = np.asarray(group['position_m'])
+            if np.any(position < low - 1e-9) or np.any(position > high + 1e-9):
+                raise ValueError('嵌入热源的位置超出模型范围。')
+    ids = {r['component_id'] for r in metadata.get('components', [])}
+    if any(r['component_id'] not in ids for r in config.get('component_materials', [])):
+        raise ValueError('材料设置引用了当前模型不存在的组件。')
 
 
 def _codex_context(model_id, prompt, current):
@@ -347,13 +236,13 @@ def _codex_context(model_id, prompt, current):
         'triangles': metadata.get('triangles'),
         'components': metadata.get('components', []),
         'surface_selections': [dict(id=key, **{k: v for k, v in selection.items() if k != 'faces'})
-                               for key, selection in _surface_selections(model_id).items()],
+                               for key, selection in _surface_selections(model_id, _requested_selections(prompt)).items()],
         'selection_rule': '轴向选区取最外侧 3% 范围内、法向朝向该方向的外表面三角面；编号由后端映射。',
     }
     schema = Simulation.model_json_schema()
     # The assistant uses semantic selectors; the solver still receives only
     # ordinary Simulation fields with resolved triangle IDs.
-    selector = dict(type='string', enum=['top', 'bottom', 'right', 'left', 'back', 'front', 'all_outer'])
+    selector = dict(type='string', enum=[x['id'] for x in geometry['surface_selections']])
     for name in ('Heat', 'Cooling'):
         schema['$defs'][name]['properties']['surface_selection'] = selector
     schema['$defs']['Cooling']['required'] = [key for key in schema['$defs']['Cooling']['required'] if key != 'faces']
@@ -362,27 +251,11 @@ def _codex_context(model_id, prompt, current):
     return schema, geometry
 
 
-def _codex_prompt(model_id, prompt, current):
-    schema, geometry = _codex_context(model_id, prompt, current)
-    instructions = (
-        '你是 Thermal Studio 的仿真配置助手。根据用户描述生成完整、可执行的 Simulation JSON 配置。'
-        '只输出一个符合给定 JSON Schema 的 JSON 对象，不要 Markdown 或解释。不要调用工具、读取文件或运行仿真。'
-        '保留当前配置中未被用户修改的字段和 model_id。必须包含至少一个有效热源，不能用空热源列表代替用户要求。'
-        '新增或修改面选区时，使用 geometry.surface_selections 中的 id，写入热源或散热区的 surface_selection 字段；'
-        '例如顶部热源使用 surface_selection="top"，不需要提供 faces。只可使用 face_count 大于零的选区。'
-        '已有选区可保留原 faces，不要猜测或生成新的数字编号。热源位置与散热位置分别处理。'
-        '全部外表面对流通常用 default_h 和 heat_convection；不得因此把顶部热源扩大为全部外表面。'
-        '材料优先采用提供的材料预设。用户确认操作在网页执行，你只返回配置。'
-    )
-    user_input = {
-        'model_id': model_id,
-        'geometry': geometry,
-        'current_config': current or {},
-        'request': prompt.strip(),
-        'material_presets': PRESETS,
-        'simulation_schema': schema,
-    }
-    return instructions + '\n输入数据：\n' + json.dumps(user_input, ensure_ascii=False)
+def _codex_prompt(model_id, prompt, current, prepared=None):
+    import agent_skill
+    import sys
+    engine = sys.modules[__name__]
+    return agent_skill.prompt_text(engine, prepared or agent_skill.prepare(engine, model_id, prompt, current))
 
 
 def _validated_codex_text(text, current, model_id=None):
@@ -405,7 +278,7 @@ def _validated_codex_text(text, current, model_id=None):
         if selector is None:
             continue
         if selections is None:
-            selections = _surface_selections(config['model_id'])
+            selections = _surface_selections(config['model_id'], [group.get('surface_selection') for group in [*config.get('heat_sources', []), *config.get('cooling', [])]] + [selector])
         if selector not in selections or not selections[selector]['faces']:
             raise ValueError(f'当前模型没有可用的“{selector}”受热/散热选区，请手动刷选后重新生成。')
         selected = selections[selector]['faces']
@@ -414,21 +287,53 @@ def _validated_codex_text(text, current, model_id=None):
         group['faces'] = selected
     validated = Simulation.model_validate(config)
     if model_id:
-        metadata = read_json(MODELS / model_id / 'metadata.json')
-        for group in [*validated.heat_sources, *validated.cooling]:
-            if group.faces and max(group.faces) >= metadata['triangles']:
-                raise ValueError('Agent 返回了当前模型不存在的面编号，请重新选取。')
+        _validate_geometry(model_id, validated.model_dump(mode='json'))
     return validated.model_dump(mode='json')
 
 
-def _codex_changes(config):
-    changes = [f'材料：{config["base_material"]["name"]}',
-               f'仿真时长：{config["duration_s"]:g} s；计算步长：{config["dt_s"]:g} s；保存间隔：{config["save_s"]:g} s']
-    for heat in config['heat_sources']:
+def _codex_changes(config, current=None):
+    current = current or {}
+    changes = []
+    labels = {
+        'name': '算例名称', 'analysis_mode': '分析类型',
+        'initial_C': '初始温度 (°C)', 'ambient_C': '环境温度 (°C)',
+        'default_h': '默认换热系数 W/(m²·K)', 'heat_convection': '热源面参与默认对流',
+        'radiation_enabled': '表面辐射', 'radiation_ambient_C': '辐射环境温度 (°C)', 'emissivity': '发射率',
+        'air_gap_enabled': '空气间隙耦合', 'air_gap_k_W_mK': '空气导热系数 W/(m·K)',
+        'air_gap_max_m': '最大空气间隙 (m)', 'contact_resistance_m2K_W': '接触热阻 m²·K/W',
+        'duration_s': '仿真时长 (s)', 'dt_s': '计算步长 (s)', 'save_s': '保存间隔 (s)', 'mesh_size_m': '网格尺寸 (m)',
+    }
+    for key, label in labels.items():
+        if config.get(key) != current.get(key):
+            value = config.get(key)
+            changes.append(f'{label}：' + ('开启' if value is True else '关闭' if value is False else str(value)))
+    if config['base_material'] != current.get('base_material'):
+        m = config['base_material']
+        changes.append(f'基础材料：{m["name"]}；k={m["k"]:g} W/(m·K)，ρ={m["rho"]:g} kg/m³，cp={m["cp"]:g} J/(kg·K)')
+    for key, label in [('component_materials', '组件材料'), ('regions', '材料区域')]:
+        if config.get(key) != current.get(key, []):
+            changes.append(label + '：' + '；'.join(
+                f'组件 {r["component_id"]+1}: {r["material"]["name"]}' if key == 'component_materials'
+                else f'{r["name"]}: {r["material"]["name"]}' for r in config.get(key, [])))
+    for index, heat in enumerate(config['heat_sources']):
+        if index < len(current.get('heat_sources', [])) and heat == current['heat_sources'][index]:
+            continue
         target = (f'{len(heat["faces"])} 个三角面' if heat['source_type'] == 'surface' and heat['placement'] != 'embedded'
                   else f'点位置 {heat.get("position_m")} m')
         changes.append(f'热源“{heat["name"]}”：{heat["power_W"]:g} W，{heat["start_s"]:g}–{heat["end_s"]:g} s，{target}')
-    return changes
+        if heat.get('power_profile'):
+            changes.append(f'热源 {index+1} 功率曲线：{json.dumps(heat["power_profile"], ensure_ascii=False)}')
+        if heat.get('thermostat'):
+            changes.append(f'热源 {index+1} 温控：{json.dumps(heat["thermostat"], ensure_ascii=False)}')
+    if len(config['heat_sources']) < len(current.get('heat_sources', [])):
+        changes.append(f'热源数量：{len(config["heat_sources"])}')
+    if config.get('cooling') != current.get('cooling', []):
+        for cooling in config.get('cooling', []):
+            changes.append(f'散热“{cooling["name"]}”：h={cooling["h"]:g} W/(m²·K)，环境 {cooling["ambient_C"]:g} °C，'
+                           f'{len(cooling["faces"])} 个三角面，辐射{"开启" if cooling["radiation"] else "关闭"}')
+        if not config.get('cooling'):
+            changes.append('已清空指定散热区')
+    return changes or ['当前参数无需修改']
 
 
 def _find_codex_cli():
@@ -533,12 +438,22 @@ def _cli_error_detail(stdout, stderr):
 
 
 def _codex_cli_plan_request(model_id, prompt, current, executable):
+    import agent_skill
+    import sys
+    started = time.perf_counter()
     try:
-        cli_prompt = _codex_prompt(model_id, prompt, current)
-    except (FileNotFoundError, json.JSONDecodeError) as error:
+        prepared = agent_skill.prepare(sys.modules[__name__], model_id, prompt, current)
+        cli_prompt = _codex_prompt(model_id, prompt, current, prepared)
+    except (OSError, ValueError, KeyError) as error:
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
                     questions=[f'无法读取模型元数据：{error}'], mode='codex', provider='cli')
-    args = [executable, 'exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--json', '--color', 'never', '-']
+    args = [executable, 'exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only', '--json', '--color', 'never',
+            '--output-schema', str(agent_skill.skill_root(sys.modules[__name__]) / 'references' / 'review-schema.json'), '-']
+    # All deterministic work is already done by the host. These child-only
+    # overrides avoid shell/MCP detours for a pure structured-text review.
+    for feature in ('shell_tool', 'unified_exec', 'apps', 'multi_agent', 'browser_use', 'computer_use'):
+        args[2:2] = ['--disable', feature]
+    args[2:2] = ['-c', 'mcp_servers.node_repl.enabled=false', '-c', 'web_search="disabled"']
     # Let the official CLI use the model/profile selected in ~/.codex unless
     # the service explicitly overrides it for this bridge.
     model = os.environ.get('THERMAL_CODEX_MODEL', '').strip()
@@ -571,13 +486,30 @@ def _codex_cli_plan_request(model_id, prompt, current, executable):
                     questions=[f'本机 Codex CLI 请求失败（退出码 {completed.returncode}）：{detail}'],
                     mode='codex', provider='cli', error_code='cli_failed')
     try:
-        config = _validated_codex_text(_cli_response_text(completed.stdout), current, model_id)
+        config, questions = agent_skill.compile_review(sys.modules[__name__], prepared, _cli_response_text(completed.stdout))
+        if questions:
+            return dict(ok=False, config=current or {}, changes=[], warnings=[], questions=questions,
+                        mode='codex', provider='cli', workflow='thermal-config', error_code='clarification')
     except Exception as error:
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
                     questions=[f'Codex 返回的配置无法通过 Simulation 校验：{str(error).split(chr(10))[0]}'],
                     mode='codex', provider='cli', error_code='invalid_config')
-    return dict(ok=True, config=config, changes=_codex_changes(config),
-                warnings=[], questions=[], mode='codex', provider='cli', model=model or None)
+    metrics = dict(elapsed_s=round(time.perf_counter() - started, 3), input_chars=len(cli_prompt),
+                   output_chars=len(_cli_response_text(completed.stdout)), tool_calls=0)
+    for line in completed.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'turn.completed':
+            metrics['usage'] = event.get('usage', {})
+        if isinstance(event, dict) and event.get('type') == 'item.completed':
+            item_type = event.get('item', {}).get('type')
+            if item_type not in ('agent_message', 'reasoning', 'error'):
+                metrics['tool_calls'] += 1
+    return dict(ok=True, config=config, changes=_codex_changes(config, prepared['original']),
+                warnings=prepared['warnings'], questions=[], mode='codex', provider='cli', model=model or None,
+                workflow='thermal-config', metrics=metrics)
 
 
 def _codex_api_plan_request(model_id, prompt, current):

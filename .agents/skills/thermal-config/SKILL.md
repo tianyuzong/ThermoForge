@@ -1,0 +1,42 @@
+---
+name: thermal-config
+description: 将自然语言热源、材料、散热和时间要求转换为 Thermal Studio 配置草案。复用本地规则提取、组件与坐标选面和配置校验，适用于生成或修改已导入模型的仿真参数。
+---
+
+# Thermal Studio 配置
+
+从本地规则生成候选配置，用语义核对纠正规则遗漏，最后由本地程序换算和验证。规则输出不是用户意图的最终裁定。
+
+## 独立使用
+
+本技能依赖完整 Thermal Studio 工程与其 Python 环境。工程路径取用户指定目录或 `THERMAL_STUDIO_ROOT`，也可使用包含 `agent.py` 和 `server.py` 的当前工程目录。不要为了配置生成修改全局 Codex 设置。
+
+准备 UTF-8 请求 JSON：`{"model_id":"已有模型ID","prompt":"用户原始要求","config":{当前完整配置}}`。保持原始要求，不能只把自己的概括传给规则。当前参数由用户提供或从用户指定的算例读取；模型不明确时先确定模型，不能随意选第一个。
+
+使用工程的 `.venv/Scripts/python.exe` 运行本技能的 `scripts/configure.py`：
+
+```text
+configure.py prepare --root <工程目录> --input <请求.json>
+configure.py validate --root <工程目录> --input <请求.json> --review <修正.json> --output <草案.json>
+```
+
+`prepare` 输出紧凑的模型摘要、当前配置、规则候选和可用选区；按下面的规则生成修正 JSON，再运行 `validate`。需要协议字段说明时读取 [review-schema.json](references/review-schema.json)。脚本只准备、校验及导出草案，没有提交计算的功能。返回重要参数变化、待确认项和草案路径；用户要求运行时使用 Thermal Studio 既有的确认流程。
+
+## 已预处理输入的核对规则
+
+网页后端直接执行上述准备步骤，并提供此段规则与输入数据。此时无须再次执行脚本或读取工程文件。
+
+<!-- prepared-review -->
+你核对 Thermal Studio 的候选配置。request 是原始需求，current 是原配置，candidate 是规则候选。逐项核对后仅返回相对 candidate 的修正：
+{"patch":[{"path":"/heat_sources/0/power_W","value_json":"25"}],"questions":[]}
+候选完全符合需求时返回 {"patch":[],"questions":[]}。不得重复整份配置。path 使用 / 分隔的参数路径；value_json 是 JSON 编码的值字符串。可替换数组，或用 /heat_sources/- 追加对象。不能修改 model_id 或填写 faces 数字。
+
+按原始需求修正规则，而非照抄候选；保留用户未要求改变的现有设置。用户指定值必须尊重，包括细网格、热源启停时间和其他已有热源。没有要求改名称时保留名称。
+- 热源功率 W 与换热系数 W/(m²·K) 分开；1 kW=1000 W，1 mm=0.001 m，1 cm=0.01 m。参数 *_m 用米，时间 *_s 用秒。
+- “顶部加热，全部外表面对流”只给顶部加热；后半句只影响散热。默认对流用 default_h、ambient_C；明确包括受热面时 heat_convection=true，排除时 false。指定局部散热应建立 cooling 选区，不能擅自扩大为默认全表面。
+- 对关闭、不要、不使用等否定词按作用对象解释；例如关闭辐射 radiation_enabled=false，关闭空气间隙 air_gap_enabled=false。启停热源时间与仿真总时长、步长、保存间隔分开。
+- 用 available_selections 的非空键设置 surface_selection。top 等是轴向最外侧选面，不等于上半部分。component:2 是界面组件2全部外表面；component:2:top 是组件2顶部。component_materials 的 component_id 则从0开始。x=0.01 表示米制坐标附近外表面。current:/candidate: 前缀选区只能用于保留相应已有面。未知位置不可换成全部外表面。
+- 点热源使用 source_type="point"、position_m=[x,y,z]，嵌入实体时 placement="embedded"，不需要 surface_selection。不能将点的x/y/z坐标误用作面选区。
+- 没有可确定的热源或位置、单位歧义或互相矛盾的要求时，用 questions 简短说明；不要猜测几何或伪造参数。复杂物性可修改 base_material/regions/component_materials，物理字段不明确时说明需要哪些值。
+规则问题可通过修正解决时无需照搬到 questions。返回值随后会经过本地 Schema 与几何校验，生成配置不代表已经仿真。
+<!-- /prepared-review -->

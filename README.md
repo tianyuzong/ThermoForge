@@ -82,11 +82,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Stop.ps1 -Port 8765
 | 页面模式 / 配置 | 行为 |
 | --- | --- |
 | 本地规则解析器 | 无需联网，按内置规则识别参数；复杂请求需检查实际生成内容 |
-| Codex，`THERMAL_CODEX_PROVIDER=cli`（默认） | 调用本机官方 `codex exec`，沿用 CLI 已有登录态；找不到 CLI 时明确报错 |
+| Codex，`THERMAL_CODEX_PROVIDER=cli`（默认） | 本地规则生成候选，Codex 通过 `thermal-config` skill 核对并返回修正；沿用 CLI 已有登录态，找不到 CLI 时明确报错 |
 | Codex，`THERMAL_CODEX_PROVIDER=api` | 使用 OpenAI Responses API，需要 `OPENAI_API_KEY` |
 | Codex，`THERMAL_CODEX_PROVIDER=auto` | 优先 CLI，仅在找不到 CLI 时改用 API；CLI 请求失败不会自动切换 API |
 
 CLI 模式需要安装并登录官方 Codex CLI，可在终端通过 `codex --version` 和 `codex login status` 检查。程序也会搜索 Windows 上官方 CLI 的本地安装目录，可用 `THERMAL_CODEX_COMMAND` 指定可执行文件路径。调用使用临时会话和只读沙箱。
+
+CLI 配置生成复用 [thermal-config skill](.agents/skills/thermal-config/SKILL.md)：规则层负责单位、材料、热源和几何选区；Codex 对照原始指令检查候选，只返回需要更正的参数路径和值。后端使用 `--output-schema` 约束修正格式，并对合并结果再次执行配置与几何校验。该模式仍会真实调用 Codex，不会将规则结果直接冒充模型结果。API 分支目前仍使用完整配置生成方式。
+
+网页核对阶段的 CLI 子进程会关闭 shell、浏览器、应用连接等额外工具，减少重复读文件和调用脚本的等待；这些设置仅用于本次子进程，不修改用户的 Codex 配置或独立技能的工具能力。
+
+草案显示“配置 Skill”和本次生成耗时，并列出散热、辐射、空气间隙、网格等参数变化。规则候选没有覆盖的复杂描述由 Codex 修正；无法确认选区或参数时会提出问题。
 
 使用 Codex 时，自然语言目标、当前配置和模型几何摘要会交给所选服务处理；三维仿真计算仍在本机执行。Codex 连接失败会显示错误，不会静默切换到本地规则解析器。
 
@@ -107,7 +113,18 @@ CLI 模式需要安装并登录官方 Codex CLI，可在终端通过 `codex --ve
 
 草案应包含 **20 W 热源、0–600 s 启停时间和非零受热面数**。确认前通过“应用后修改”检查选区，尤其要核对模型摆放方向和尺寸。
 
-“顶部/底部、左/右、前/后、全部外表面”会由本地几何代码转换为真实面编号。轴向选区取该方向最外侧 3% 范围内、法向朝向该方向的外表面三角面；它并不代表任意形状完整的上半部分。缺少热源、选区为空、面编号无效或模型不匹配时，草案不能确认运行。
+“顶部/底部、左/右、前/后、全部外表面”会由本地几何代码转换为真实面编号。两种解析器共享组件与坐标选区，例如“组件 2 外表面”“组件 2 顶部”“x=10 mm 附近表面”；点热源的坐标单独处理。缺少可定位的组件几何时会要求手动选面。轴向选区取该方向最外侧 3% 范围内、法向朝向该方向的外表面三角面，它不代表任意形状完整的上半部分。缺少热源、选区为空、面编号无效或模型不匹配时，草案不能确认运行。
+
+### 独立使用配置 skill
+
+仓库中的 [.agents/skills/thermal-config](.agents/skills/thermal-config/SKILL.md) 也可供 Codex 独立发现和调用，例如：
+
+```text
+使用 $thermal-config，根据指定模型和当前配置，把第一个热源功率改为35W，
+保留其他热源、选区和散热条件，生成并验证配置草案。
+```
+
+技能包含可执行的 `prepare` / `validate` 助手脚本，可读取原始请求、生成规则候选并校验修正结果。它依赖本工程及其 Python 环境，不包含提交计算的命令。网页直接调用相同准备和校验逻辑，避免让 CLI 为每条指令重复读写中间文件。独立技能流程包含额外工具调用，耗时应与网页预处理流程分开评估。
 
 ### 环境变量
 
@@ -201,6 +218,15 @@ node --check static/app.js
 
 测试覆盖基础物理算例、几何质量、扩展配置、CPU 热网络以及 Agent 连接、热源选区和前端草案校验；它们不代表上述所有高级模型均已完成工程验证。
 
+可选的解析器对比脚本会创建两个方块的测试几何并核对材料、选区、单位和时间。真实 Codex 调用需要显式传入 `--live`；输出写入 `.runtime/agent-benchmark/`，不会提交仿真：
+
+```powershell
+.\.venv\Scripts\python.exe tests/benchmark_agent_skill.py local
+.\.venv\Scripts\python.exe tests/benchmark_agent_skill.py skill --live --model gpt-6-astra
+```
+
+如需比较旧版本，可为 `baseline` 模式提供 `--baseline-agent <旧版agent.py>`，使用相同模型与输入。单次样例用时受网络及服务负载影响，应保留原始记录并区分网页预处理流程与独立技能工具流程。
+
 另有可选的 API 集成脚本：先在默认 `8765` 端口启动服务，再运行：
 
 ```powershell
@@ -217,12 +243,15 @@ node --check static/app.js
 | [geometry.py](geometry.py) | 几何处理、质量检查、CAD 分区与体积网格 |
 | [solver.py](solver.py) | 有限元组装、时间积分、边界条件、剖切、位移估算与导出 |
 | [analysis.py](analysis.py) | CPU 热网络、换热系数拟合、功率与循环估算 |
-| [agent.py](agent.py) | 自然语言解析、CLI / API 连接、面选区映射与配置校验 |
+| [agent.py](agent.py) | CLI / API 连接、共享面选区映射、配置校验与变更摘要 |
+| [agent_rules.py](agent_rules.py) | 分句后的正则提取、单位换算、启停时间、否定词与候选配置 |
+| [agent_skill.py](agent_skill.py) | 紧凑上下文、skill 修正协议与本地合并校验 |
 | [schemas.py](schemas.py) | 参数模型、校验与材料预设 |
 | [runtime.py](runtime.py)、[worker.py](worker.py) | 运行目录、工作进程与计算任务执行 |
 | [static/](static/) | 三维界面、CPU 工作台、使用说明和本地前端依赖 |
 | [tests/](tests/) | Python、前端与 API 集成验证 |
 | [plugins/thermal-studio/](plugins/thermal-studio/README.md) | Codex 插件源码与辅助脚本 |
+| [.agents/skills/thermal-config/](.agents/skills/thermal-config/SKILL.md) | 配置 skill、确定性助手脚本和输出 Schema |
 
 ## 常见问题
 
