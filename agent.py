@@ -145,10 +145,20 @@ def make_plan(model_id, prompt, current):
     return extract_rules(sys.modules[__name__], model_id, prompt, current)
 
 
-def plan_request(model_id, prompt, current):
-    if not prompt or len(prompt.strip()) < 2:
+def plan_request(model_id, prompt, current, conversation=None):
+    if not prompt or not prompt.strip():
         return dict(ok=False, config=current, changes=[], warnings=[], questions=['请描述材料、热源功率、时长和受热面。'])
-    return make_plan(model_id, prompt.strip(), current)
+    from agent_conversation import rule_candidate
+    import sys
+    result = rule_candidate(sys.modules[__name__], model_id, prompt.strip(), current, conversation)
+    if conversation and conversation.get('history'):
+        if not result['ok'] or result['config'] == current:
+            result['ok'] = False
+            result['questions'].append('本地规则无法确定这次补充是否完整解决了前文要求；请明确参数及作用对象，或切换 Codex 后重试这条补充。')
+        result['changes'] = _codex_changes(result['config'], current) if result['ok'] else []
+    if not result['ok']:
+        result['error_code'] = 'clarification'
+    return result
 
 
 def _response_text(payload):
@@ -444,12 +454,12 @@ def _cli_error_detail(stdout, stderr):
     return (stderr or stdout or '').strip()[-800:]
 
 
-def _codex_cli_plan_request(model_id, prompt, current, executable):
+def _codex_cli_plan_request(model_id, prompt, current, executable, conversation=None):
     import agent_skill
     import sys
     started = time.perf_counter()
     try:
-        prepared = agent_skill.prepare(sys.modules[__name__], model_id, prompt, current)
+        prepared = agent_skill.prepare(sys.modules[__name__], model_id, prompt, current, conversation)
         cli_prompt = _codex_prompt(model_id, prompt, current, prepared)
     except (OSError, ValueError, KeyError) as error:
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
@@ -520,7 +530,7 @@ def _codex_cli_plan_request(model_id, prompt, current, executable):
                 workflow='thermal-config', metrics=metrics)
 
 
-def _codex_api_plan_request(model_id, prompt, current):
+def _codex_api_plan_request(model_id, prompt, current, conversation=None):
     api_key = os.environ.get('OPENAI_API_KEY', '').strip()
     if not api_key:
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
@@ -548,6 +558,18 @@ def _codex_api_plan_request(model_id, prompt, current):
         'request': prompt.strip(),
         'simulation_schema': schema,
     }
+    prepared = None
+    if conversation is not None:
+        import agent_skill
+        import sys
+        try:
+            prepared = agent_skill.prepare(sys.modules[__name__], model_id, prompt, current, conversation)
+        except (OSError, ValueError, KeyError) as error:
+            return dict(ok=False, config=current or {}, changes=[], warnings=[], questions=[str(error)],
+                        mode='codex', provider='api', error_code='invalid_config')
+        instructions = agent_skill.review_instructions(sys.modules[__name__])
+        user_input = prepared['public']
+        schema = json.loads((agent_skill.skill_root(sys.modules[__name__]) / 'references' / 'review-schema.json').read_text(encoding='utf-8'))
     body = json.dumps({
         'model': model,
         'input': [
@@ -557,11 +579,11 @@ def _codex_api_plan_request(model_id, prompt, current):
         'text': {
             'format': {
                 'type': 'json_schema',
-                'name': 'simulation_config',
+                'name': 'thermal_config_review' if prepared is not None else 'simulation_config',
                 # Pydantic defaults are optional in its generated schema;
                 # non-strict structured output keeps those defaults valid,
                 # while Simulation.model_validate below remains authoritative.
-                'strict': False,
+                'strict': prepared is not None,
                 'schema': schema,
             }
         },
@@ -585,15 +607,23 @@ def _codex_api_plan_request(model_id, prompt, current):
         text = _response_text(payload)
         if not text:
             raise ValueError('Responses API 未返回文本结果')
-        config = _validated_codex_text(text, current, model_id)
+        if prepared is not None:
+            config, questions = agent_skill.compile_review(sys.modules[__name__], prepared, text)
+            if questions:
+                return dict(ok=False, config=current or {}, changes=[], warnings=[], questions=questions,
+                            mode='codex', provider='api', workflow='thermal-config', error_code='clarification')
+        else:
+            config = _validated_codex_text(text, current, model_id)
     except Exception as error:
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
-                    questions=[f'Codex 返回的配置无法通过 Simulation 校验：{str(error).split(chr(10))[0]}'], mode='codex', provider='api')
-    return dict(ok=True, config=config, changes=_codex_changes(config),
-                warnings=[], questions=[], mode='codex', provider='api', model=model)
+                    questions=[f'Codex 返回的配置无法通过 Simulation 校验：{str(error).split(chr(10))[0]}'],
+                    mode='codex', provider='api', error_code='invalid_config')
+    return dict(ok=True, config=config, changes=_codex_changes(config, current),
+                warnings=prepared['warnings'] if prepared else [], questions=[], mode='codex', provider='api', model=model,
+                workflow='thermal-config' if prepared else 'legacy')
 
 
-def codex_plan_request(model_id, prompt, current):
+def codex_plan_request(model_id, prompt, current, conversation=None):
     """Generate a validated Simulation config using the local Codex client by default.
 
     Set THERMAL_CODEX_PROVIDER=api to use the legacy Responses API. ``auto``
@@ -606,9 +636,9 @@ def codex_plan_request(model_id, prompt, current):
     if provider in ('cli', 'auto'):
         executable = _find_codex_cli()
         if executable:
-            return _codex_cli_plan_request(model_id, prompt, current, executable)
+            return _codex_cli_plan_request(model_id, prompt, current, executable, conversation)
         if provider == 'cli':
             return dict(ok=False, config=current or {}, changes=[], warnings=[],
                         questions=['未找到本机 Codex CLI（codex.exe）。请安装官方 Codex CLI，或设置 THERMAL_CODEX_PROVIDER=api。'],
                         mode='codex', provider='cli')
-    return _codex_api_plan_request(model_id, prompt, current)
+    return _codex_api_plan_request(model_id, prompt, current, conversation)

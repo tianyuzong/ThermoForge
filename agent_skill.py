@@ -3,22 +3,43 @@ import copy
 import json
 import re
 
-from schemas import Simulation
+from pydantic import ValidationError
+from schemas import Heat, Simulation
 
 
 def skill_root(engine):
     return engine.ROOT / '.agents' / 'skills' / 'thermal-config'
 
 
-def prepare(engine, model_id, prompt, current):
+def draft_current(model_id, current):
+    value = {**copy.deepcopy(current or {}), 'model_id': model_id}
+    try:
+        return Simulation.model_validate(value).model_dump(mode='json')
+    except ValidationError:
+        # A manually entered zero step or a heater awaiting its selection is
+        # editable input, not a runnable configuration. Keep invalid/missing
+        # required values for clarification; add only ordinary schema defaults.
+        original = Simulation(model_id=model_id).model_dump(mode='json')
+        original.update(value)
+        for heat in original.get('heat_sources', []):
+            if isinstance(heat, dict):
+                for key, field in Heat.model_fields.items():
+                    if key not in heat and not field.is_required():
+                        heat[key] = field.get_default(call_default_factory=True)
+        return original
+
+
+def prepare(engine, model_id, prompt, current, conversation=None):
     if current and current.get('model_id', model_id) != model_id:
         raise ValueError('当前配置属于其他模型。')
-    original = Simulation.model_validate({**copy.deepcopy(current or {}), 'model_id': model_id}).model_dump(mode='json')
-    candidate = engine.make_plan(model_id, prompt, original)
-    selectors = engine._surface_selections(model_id, engine._requested_selections(prompt))
+    original = draft_current(model_id, current)
+    from agent_conversation import rule_candidate, user_prompts
+    candidate = rule_candidate(engine, model_id, prompt, original, conversation)
+    geometry_request = '\n'.join(user_prompts(prompt, conversation))
+    selectors = engine._surface_selections(model_id, engine._requested_selections(geometry_request))
     public_selectors = {key: {'face_count': value['face_count']} for key, value in selectors.items()
                         if not key.startswith('component:') or int(key.split(':')[1]) in
-                        {int(n) for n in re.findall(r'(?:组件|部件)\s*(\d+)', prompt)}}
+                        {int(n) for n in re.findall(r'(?:组件|部件)\s*(\d+)', geometry_request)}}
 
     def compact(config, prefix):
         result = copy.deepcopy(config)
@@ -43,25 +64,32 @@ def prepare(engine, model_id, prompt, current):
                   current=compact(original, 'current'), candidate=compact(candidate['config'], 'candidate'),
                   available_selections=public_selectors,
                   rule_questions=candidate.get('questions', []), rule_warnings=candidate.get('warnings', []))
+    if conversation is not None:
+        public['conversation'] = copy.deepcopy(conversation)
     from agent_parameters import parameter_contract
     public['parameter_contract'] = parameter_contract()
-    if re.search(r'中心|中间|中部|中央|正中', prompt):
+    if re.search(r'中心|中间|中部|中央|正中', geometry_request):
         center = [(a+b)/2 for a,b in zip(*metadata['bounds_m'])]
         public['geometry'].update(center_m=center, center_in_solid=engine._point_in_solid(model_id, center))
         for component in public['geometry']['components']:
-            if component.get('bounds_m') and str(component['component_id']+1) in re.findall(r'(?:组件|部件)\s*(\d+)', prompt):
+            if component.get('bounds_m') and str(component['component_id']+1) in re.findall(r'(?:组件|部件)\s*(\d+)', geometry_request):
                 center = [(a+b)/2 for a,b in zip(*component['bounds_m'])]
                 component.update(center_m=center, center_in_solid=engine._point_in_solid(model_id, center))
     return dict(model_id=model_id, original=original, candidate=candidate['config'],
                 selectors=selectors, public=public, warnings=candidate.get('warnings', []))
 
 
-def prompt_text(engine, prepared):
+def review_instructions(engine):
     text = (skill_root(engine) / 'SKILL.md').read_text(encoding='utf-8')
     instructions = text.split('<!-- prepared-review -->', 1)[1].split('<!-- /prepared-review -->', 1)[0].strip()
     return ('宿主已加载下列 thermal-config skill 说明并完成规则提取、几何计算。这是纯文本核对阶段：'
             '不要调用工具、读取或写入文件、运行脚本或再次加载技能；只输出修正 JSON。\n'
-            + instructions + '\n输入数据：\n' + json.dumps(prepared['public'], ensure_ascii=False, separators=(',', ':')))
+            + instructions)
+
+
+def prompt_text(engine, prepared):
+    return (review_instructions(engine) + '\n输入数据：\n'
+            + json.dumps(prepared['public'], ensure_ascii=False, separators=(',', ':')))
 
 
 def _check_no_faces(value):

@@ -82,8 +82,8 @@ def cpu_simulation(request:CpuSimulation):
 def agent_plan(request:AgentRequest):
     located(MODELS, request.model_id)
     if request.mode == 'codex':
-        return codex_plan_request(request.model_id, request.prompt, request.config)
-    result = plan_request(request.model_id, request.prompt, request.config)
+        return codex_plan_request(request.model_id, request.prompt, request.config, request.conversation())
+    result = plan_request(request.model_id, request.prompt, request.config, request.conversation())
     result['mode'] = 'local'
     return result
 

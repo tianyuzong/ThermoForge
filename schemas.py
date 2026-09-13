@@ -126,13 +126,36 @@ class Simulation(Strict):
         if self.duration_s/self.save_s>300: raise ValueError('单次最多保存 301 帧，请增大保存间隔')
         return self
 
+class AgentMessage(Strict):
+    role: Literal['user', 'assistant']
+    content: str = Field(min_length=1, max_length=12000)
+
+
 class AgentRequest(Strict):
     model_id: str = Field(pattern=r'^[a-zA-Z0-9_-]{1,60}$')
-    prompt: str = Field(min_length=2, max_length=4000)
+    prompt: str = Field(min_length=1, max_length=4000)
     config: dict = Field(default_factory=dict)
+    history: list[AgentMessage] = Field(default_factory=list, max_length=200)
+    # Number of messages already represented by config (last validated draft).
+    applied_message_count: int = Field(default=0, ge=0)
     # Select the deterministic local parser or the optional OpenAI Responses
     # API integration.  Local remains the default for existing clients.
     mode: Literal['local', 'codex'] = 'local'
+
+    @model_validator(mode='after')
+    def conversation_bounds(self):
+        if self.applied_message_count > len(self.history) or self.applied_message_count % 2:
+            raise ValueError('会话配置标记必须位于已完成的一轮对话之后')
+        if len(self.history) % 2 or any(m.role != ('user' if i % 2 == 0 else 'assistant')
+                                      for i, m in enumerate(self.history)):
+            raise ValueError('历史消息必须由完整的用户/助手对话轮次组成')
+        if len(self.prompt) + sum(len(m.content) for m in self.history) > 120000:
+            raise ValueError('本轮对话过长，请应用已确认的草案后开始新对话')
+        return self
+
+    def conversation(self):
+        return dict(history=[m.model_dump() for m in self.history],
+                    applied_message_count=self.applied_message_count)
 
 class CalibrationPoint(Strict):
     time_s: Finite = Field(ge=0, le=864000)

@@ -3,6 +3,7 @@ import {OrbitControls} from '/vendor/OrbitControls.js';
 const $=id=>document.getElementById(id),$$=s=>Array.from(document.querySelectorAll(s));
 const clone=x=>JSON.parse(JSON.stringify(x));
 let boot,model,display,cfg,agentConfig=null,agentRunning=false,tab='model',activeRegion=-1,activeHeat=0,activeCooling=0,action='orbit',view='setup',dirty=false,jobId=null,busyId=null,result=null,temperatures=null,frame=0,slice=null,playing=false,playTimer=null,toastTimer=null,loadGeneration=0,recoveredTimer=null,uniformResult=false;
+let agentConversation=null,agentRequestGeneration=0;
 let points,faces,centers,normals,areas,neighbors,solid,geometry,creases,boxGroup=new THREE.Group(),sliceMesh,axes,partSpan=1;
 let surfaceComponent='all',surfaceVertexComponents=null,surfaceRange={low:25,high:25.5};
 let cpuMode=false,cpuResult=null,cpuGroup=new THREE.Group(),cpuSurfaceMesh=null,cpuBoardMesh=null,cpuCoolerMesh=null,cpuFanMesh=null;
@@ -44,7 +45,7 @@ function fit(front=true){if(!model)return;const bounds=model.bounds_m,center=new
 function loadMesh(data){display=data;points=new Float32Array(data.points);faces=new Uint32Array(data.faces);clearObject(solid);clearObject(creases);clearObject(sliceMesh);sliceMesh=null;slice=null;geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.BufferAttribute(points,3));geometry.setIndex(new THREE.BufferAttribute(faces,1));geometry.setAttribute('color',new THREE.BufferAttribute(new Float32Array(points.length),3));geometry.computeVertexNormals();solid=new THREE.Mesh(geometry,setupMaterial);scene.add(solid);creases=new THREE.LineSegments(new THREE.EdgesGeometry(geometry,38),new THREE.LineBasicMaterial({color:0x455a76,transparent:true,opacity:.12,depthWrite:false}));scene.add(creases);buildAdjacency();buildSurfaceComponents();fit();refreshInfo();drawBoxes();drawHeatMarkers();recolor();}
 function buildSurfaceComponents(){surfaceVertexComponents=null;surfaceComponent='all';const records=(model?.components||[]).filter(c=>Array.isArray(c.bounds_m)&&c.bounds_m.length===2);const select=$('surface-component');if(select)select.replaceChildren(new Option('整个模型','all'));if(!records.length||!centers?.length)return;const boxes=records.map(c=>({id:Number(c.component_id),name:c.name||('组件 '+(Number(c.component_id)+1)),lo:new THREE.Vector3(...c.bounds_m[0]),hi:new THREE.Vector3(...c.bounds_m[1]),center:new THREE.Vector3(...c.bounds_m[0]).add(new THREE.Vector3(...c.bounds_m[1])).multiplyScalar(.5)}));const faceIds=new Int32Array(areas.length);for(let f=0;f<areas.length;f++){const p=new THREE.Vector3().fromArray(centers,f*3);let best=boxes.find(b=>p.x>=b.lo.x-1e-7&&p.x<=b.hi.x+1e-7&&p.y>=b.lo.y-1e-7&&p.y<=b.hi.y+1e-7&&p.z>=b.lo.z-1e-7&&p.z<=b.hi.z+1e-7);if(!best)best=boxes.reduce((a,b)=>p.distanceToSquared(a.center)<p.distanceToSquared(b.center)?a:b);faceIds[f]=best.id;}const votes=Array.from({length:points.length/3},()=>new Map());for(let f=0;f<faceIds.length;f++)for(let j=0;j<3;j++){const v=faces[f*3+j],map=votes[v];map.set(faceIds[f],(map.get(faceIds[f])||0)+1);}surfaceVertexComponents=new Int32Array(points.length/3);for(let v=0;v<votes.length;v++){let best=-1,count=-1;for(const [id,n] of votes[v])if(n>count){best=id;count=n;}surfaceVertexComponents[v]=best;}if(select)for(const b of boxes)select.append(new Option(b.name,String(b.id)));}
 function newConfig(m){return {model_id:m.id,name:m.name.replace(/\.[^.]+$/,'')+' · 热仿真',base_material:clone(boot.materials[0]),regions:[],component_materials:[],heat_sources:[],cooling:[],analysis_mode:'transient',initial_C:25,ambient_C:25,radiation_ambient_C:25,default_h:10,heat_convection:false,radiation_enabled:false,emissivity:.8,air_gap_enabled:true,air_gap_k_W_mK:.026,air_gap_max_m:.05,contact_resistance_m2K_W:0,duration_s:3600,dt_s:15,save_s:15,mesh_size_m:Math.max(...m.dimensions_m)/30};}
-async function loadModel(id,configuration=null){const generation=++loadGeneration;stopPlay();const loadedModel=await api('/models/'+id);if(loadedModel.state!=='ready')throw new Error('模型尚未准备完成');const mesh=await api('/models/'+id+'/display');if(generation!==loadGeneration)return false;model=loadedModel;cfg=configuration?Object.assign(newConfig(model),clone(configuration)):newConfig(model);cfg.base_material=Object.assign(clone(boot.materials[0]),cfg.base_material);cfg.regions=(cfg.regions||[]).map(r=>({...r,material:Object.assign(clone(boot.materials[0]),r.material)}));cfg.component_materials=cfg.component_materials||[];cfg.heat_sources=(cfg.heat_sources||[]).map(h=>({...h,power_profile:h.power_profile||[],thermostat:h.thermostat||null}));cfg.cooling=(cfg.cooling||[]).map(c=>({...c,radiation:!!c.radiation,emissivity:c.emissivity??.85}));result=null;temperatures=null;jobId=null;dirty=false;activeRegion=-1;activeHeat=0;activeCooling=0;view='setup';$('temperature-view').disabled=true;$('dirty-note').hidden=true;$('show-slice').checked=false;setupMaterial.clippingPlanes=[];resultMaterial.clippingPlanes=[];loadMesh(mesh);$('model-select').value=id;syncFields();setView('setup');return true;}
+async function loadModel(id,configuration=null){const generation=++loadGeneration;resetAgentConversation();stopPlay();const loadedModel=await api('/models/'+id);if(loadedModel.state!=='ready')throw new Error('模型尚未准备完成');const mesh=await api('/models/'+id+'/display');if(generation!==loadGeneration)return false;model=loadedModel;cfg=configuration?Object.assign(newConfig(model),clone(configuration)):newConfig(model);cfg.base_material=Object.assign(clone(boot.materials[0]),cfg.base_material);cfg.regions=(cfg.regions||[]).map(r=>({...r,material:Object.assign(clone(boot.materials[0]),r.material)}));cfg.component_materials=cfg.component_materials||[];cfg.heat_sources=(cfg.heat_sources||[]).map(h=>({...h,power_profile:h.power_profile||[],thermostat:h.thermostat||null}));cfg.cooling=(cfg.cooling||[]).map(c=>({...c,radiation:!!c.radiation,emissivity:c.emissivity??.85}));result=null;temperatures=null;jobId=null;dirty=false;activeRegion=-1;activeHeat=0;activeCooling=0;view='setup';$('temperature-view').disabled=true;$('dirty-note').hidden=true;$('show-slice').checked=false;setupMaterial.clippingPlanes=[];resultMaterial.clippingPlanes=[];resetAgentConversation();loadMesh(mesh);$('model-select').value=id;syncFields();setView('setup');return true;}
 function refreshInfo(){const dl=$('model-info');dl.replaceChildren();const components=Array.isArray(model.components)?model.components:[],openComponents=components.filter(c=>c.closed===false);const componentText=components.length?`${components.length} 个（${openComponents.length} 个开口）`:'未提供组件信息';for(const [k,v] of [['尺寸 · cm',model.dimensions_m.map(x=>(x*100).toFixed(2)).join(' × ')],['表面三角形',model.triangles.toLocaleString()],['内部空腔面',model.cavity_triangles.toLocaleString()],['组件',componentText],['格式',model.kind.toUpperCase()]]){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;dl.append(dt,dd);}const warnings=[];if(model.warning)warnings.push(model.warning);if(openComponents.length)warnings.push(`检测到 ${openComponents.length} 个开口组件，无法可靠生成体积网格；请修复 STL 后再运行。`);$('model-warning').textContent=warnings.join(' ');$('model-warning').hidden=!warnings.length;$('model-count').textContent=model.vertices.toLocaleString()+' 个表面顶点';$('brush-radius').value=+(Math.max(...model.dimensions_m)*5).toFixed(2);}
 function setOptions(select,items,value){select.replaceChildren();for(const item of items){const option=document.createElement('option');option.value=item.id;option.textContent=item.name;select.append(option);}if(value!==undefined)select.value=value;}
 async function refreshLibrary(){boot=await api('/bootstrap');setOptions($('model-select'),boot.models.filter(m=>m.state==='ready'),model?.id);setOptions($('project-select'),[{id:'',name:'选择保存的算例…'},...boot.projects]);setOptions($('material-preset'),boot.materials.map((m,i)=>({id:String(i),name:m.name})));renderHistory();}
@@ -105,76 +106,127 @@ $('mesh-size').onchange=()=>{cfg.mesh_size_m=number('mesh-size')/1000;changed();
 $('model-select').onchange=protect(()=>loadModel($('model-select').value));
 $('project-select').onchange=protect(async()=>{const id=$('project-select').value;if(!id)return;const p=await api('/projects/'+id);await loadModel(p.model_id,p.config);toast('已加载算例：'+p.name);});
 $('save-project').onclick=protect(async()=>{if(!cfg)throw new Error('请先导入模型');await post('/projects',cfg);await refreshLibrary();toast('算例已保存到本机');});
-$('agent-open').onclick=()=>{if(!cfg){toast('请先导入或选择一个模型',true);return;}$('agent-dialog').hidden=false;$('agent-prompt').focus();};
+function resetAgentConversation(notice=''){
+  agentRequestGeneration++;
+  agentConversation=cfg?{base:clone(cfg),anchor:JSON.stringify(cfg),history:[],applied:0,busy:false}:null;
+  agentConfig=null;
+  $('agent-prompt').value='';
+  $('agent-plan-box').hidden=true;
+  $('agent-conversation-note').textContent=notice||'可以分次补充参数或回答追问。必需问题全部解决后，才能确认并仿真。';
+  renderAgentHistory();
+  syncAgentComposer();
+}
+function ensureAgentConversation(){
+  if(!agentConversation||agentConversation.anchor!==JSON.stringify(cfg))
+    resetAgentConversation(agentConversation?'主界面参数已更新，已基于当前参数开始新对话。':'');
+}
+function renderAgentHistory(messages=agentConversation?.history||[]){
+  const list=$('agent-history');
+  list.replaceChildren();list.hidden=!messages.length;
+  for(const message of messages){
+    const entry=document.createElement('article'),name=document.createElement('strong'),body=document.createElement('div');
+    entry.className='agent-message '+message.role;
+    name.textContent=message.role==='user'?'你':'仿真助手';body.textContent=message.content;
+    entry.append(name,body);list.append(entry);
+  }
+  list.scrollTop=list.scrollHeight;
+}
+function syncAgentComposer(){
+  const busy=!!agentConversation?.busy,continuing=!!agentConversation?.history.length;
+  $('agent-plan').disabled=busy;
+  $('agent-mode').disabled=busy;
+  $('agent-prompt').disabled=busy;
+  $('agent-plan').textContent=busy?'分析中…':continuing?'发送补充':'生成配置';
+  $('agent-prompt-label').textContent=continuing?'继续补充或回答问题':'仿真目标';
+  $('agent-prompt').placeholder=continuing?'直接回答上方问题，或描述要调整的参数；可分多次补充。':'例如：在模型内部中心新增一个 3000 W 点热源，仿真 180 秒。';
+  const ready=!!agentConfig&&!busy&&!$('agent-prompt').value.trim();
+  $('agent-apply').disabled=!ready;$('agent-confirm').disabled=!ready;
+}
+$('agent-open').onclick=()=>{if(!cfg){toast('请先导入或选择一个模型',true);return;}ensureAgentConversation();$('agent-dialog').hidden=false;$('agent-prompt').focus();};
 $('agent-close').onclick=()=>$('agent-dialog').hidden=true;
 $('agent-dialog').onclick=e=>{if(e.target===$('agent-dialog'))$('agent-dialog').hidden=true;};
+$('agent-new').onclick=()=>{resetAgentConversation();$('agent-prompt').focus();};
+$('agent-prompt').oninput=syncAgentComposer;
+$('agent-prompt').onkeydown=e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)&&!e.isComposing){e.preventDefault();if(!$('agent-plan').disabled)$('agent-plan').click();}};
 $('agent-trace-close').onclick=()=>$('agent-trace').hidden=true;
 const agentModeLabels={local:'本地规则解析器',codex:'Codex'};
-function refreshAgentModeHint(){const mode=$('agent-mode')?.value||'local';$('agent-mode-hint').textContent=mode==='codex'?'Codex 模式调用本机官方 Codex CLI；如需 API 请设置 THERMAL_CODEX_PROVIDER=api。':'本地模式在当前电脑上解析参数，无需联网。';}
+function refreshAgentModeHint(){const mode=$('agent-mode')?.value||'local';$('agent-mode-hint').textContent=mode==='codex'?'Codex 可结合上下文理解简短回复，逐轮补全配置。默认调用本机官方 Codex CLI。':'本地模式支持明确参数的逐轮修改；涉及指代、选择或复杂追问时，请切换 Codex，已有对话会保留。';}
 $('agent-mode').onchange=refreshAgentModeHint;
  $('agent-plan').onclick=protect(async()=>{
   if(!cfg)throw new Error('请先导入模型');
+  if(agentConversation?.busy)return;
   const prompt=$('agent-prompt').value.trim();
-  if(!prompt)throw new Error('请先描述仿真目标');
-  const mode=$('agent-mode')?.value||'local',requestConfig=clone(cfg);
-  const started=Date.now();
-  agentConfig=null;
-  $('agent-apply').disabled=true;
-  $('agent-confirm').disabled=true;
+  if(!prompt)throw new Error('请描述仿真目标或回答上方问题');
+  ensureAgentConversation();
+  $('agent-prompt').value=prompt;
+  const state=agentConversation,mode=$('agent-mode')?.value||'local',requestConfig=clone(state.base);
+  if(prompt.length>4000||state.history.length>=200||prompt.length+state.history.reduce((n,m)=>n+m.content.length,0)>120000)
+    throw new Error('对话内容超过单次处理范围，请缩短输入，或整理未解决要求后开始新对话。');
+  const requestGeneration=++agentRequestGeneration,modelGeneration=loadGeneration;
+  const isCurrent=()=>agentConversation===state&&requestGeneration===agentRequestGeneration&&modelGeneration===loadGeneration&&cfg?.model_id===requestConfig.model_id;
+  const started=Date.now(),userMessage={role:'user',content:prompt};
+  agentConfig=null;state.busy=true;syncAgentComposer();
   $('agent-plan-box').hidden=true;
+  renderAgentHistory([...state.history,userMessage]);
   agentTraceReset();
-  const showWaiting=()=>agentTraceSet(0,'active',(agentModeLabels[mode]||mode)+' 正在生成配置 · 已等待 '+Math.floor((Date.now()-started)/1000)+' 秒');
+  const showWaiting=()=>{if(isCurrent())agentTraceSet(0,'active',(agentModeLabels[mode]||mode)+' 正在核对配置 · 已等待 '+Math.floor((Date.now()-started)/1000)+' 秒');};
   showWaiting();
   const waitingTimer=setInterval(showWaiting,1000);
-  $('agent-plan').disabled=true;
-  $('agent-plan').textContent='分析中…';
   try{
-    const plan=await post('/agent/plan',{model_id:requestConfig.model_id,prompt,config:requestConfig,mode});
-    clearInterval(waitingTimer);
-    if(cfg.model_id!==requestConfig.model_id)throw new Error('生成期间已切换模型，请为当前模型重新生成配置。');
+    const plan=await post('/agent/plan',{model_id:requestConfig.model_id,prompt,config:requestConfig,mode,
+      history:clone(state.history),applied_message_count:state.applied});
+    if(!isCurrent())return;
     const questions=plan.questions||[];
     $('agent-plan-box').hidden=false;
     const detailLabel=(agentModeLabels[mode]||mode)+(plan.workflow==='thermal-config'?' · 配置 Skill':'')+(Number.isFinite(plan.metrics?.elapsed_s)?' · '+plan.metrics.elapsed_s.toFixed(1)+' 秒':'');
     $('agent-plan-mode').textContent=' · '+detailLabel;
-    if(!plan.ok){
+    if(!plan.ok||questions.length){
       const detail=questions.join('\n')||'配置生成失败，请重试。';
-      agentTraceSet(0,'error',detail);
-      $('agent-plan-text').textContent='配置生成未完成，当前参数保持不变。';
+      const clarification=['clarification','invalid_config'].includes(plan.error_code)||(plan.ok&&questions.length)||(!plan.error_code&&mode==='local');
+      agentTraceSet(0,clarification?'active':'error',detail);
+      $('agent-plan-text').textContent=clarification?'配置尚未完成，请在下方回答待解决问题。':'配置生成未完成，保留本条输入，可重试。';
       $('agent-plan-questions').textContent=detail;
       $('agent-plan-questions').classList.add('has-warning');
+      if(clarification){
+        state.history.push(userMessage,{role:'assistant',content:detail});
+        $('agent-prompt').value='';
+      }
+      renderAgentHistory();
       return;
     }
-    if(!plan.config?.heat_sources?.length)throw new Error('Agent 草案没有生成热源。请重新生成或手动添加热源；本次不能确认运行。');
+    if(!plan.config?.heat_sources?.length)throw new Error('Agent 草案没有生成热源。请补充热源或手动添加；本次不能确认运行。');
     if(plan.config.model_id!==requestConfig.model_id)throw new Error('Agent 草案属于其他模型，请为当前模型重新生成。');
-    agentConfig=plan.config;
+    agentConfig=clone(plan.config);
+    const lines=[...(plan.changes||[]).map(x=>'✓ '+x),...(plan.warnings||[]).map(x=>'! '+x)];
+    const summary=lines.length?lines.join('\n'):'当前配置无需修改。';
+    state.history.push(userMessage,{role:'assistant',content:summary+'\n必需参数已通过校验。可继续补充，或点击“确认并仿真”。'});
+    state.base=clone(agentConfig);state.applied=state.history.length;
+    $('agent-prompt').value='';
+    renderAgentHistory();
     agentTraceSet(0,'done','已收到配置 · '+detailLabel);
     agentTraceSet(1,'done','模型 '+model.name+' · 请核对热源选区');
     agentTraceSet(2,'done',(plan.changes||[]).join(' · ')||'保持当前参数');
-    agentTraceSet(3,'done',questions.join(' ')||'配置结构校验通过，请核对参数后确认');
-    const lines=[...(plan.changes||[]).map(x=>'✓ '+x),...(plan.warnings||[]).map(x=>'! '+x)];
-    $('agent-plan-text').textContent=lines.length?lines.join('\n'):'当前配置无需修改。';
-    $('agent-plan-questions').textContent=questions.length?questions.join('\n'):'请核对配置；确认后运行。';
-    $('agent-plan-questions').classList.toggle('has-warning',!!questions.length);
-    $('agent-apply').disabled=false;
-    $('agent-confirm').disabled=false;
+    agentTraceSet(3,'done','必需参数与几何校验通过，等待用户确认');
+    $('agent-plan-text').textContent=summary;
+    $('agent-plan-questions').textContent='参数已完整。可继续补充，或确认并仿真。';
+    $('agent-plan-questions').classList.toggle('has-warning',false);
   }catch(error){
+    if(!isCurrent())return;
     agentConfig=null;
-    $('agent-apply').disabled=true;
-    $('agent-confirm').disabled=true;
     agentTraceSet(0,'error',error.message);
     $('agent-plan-box').hidden=false;
     $('agent-plan-mode').textContent=' · '+(agentModeLabels[mode]||mode);
-    $('agent-plan-text').textContent='配置生成未完成，当前参数保持不变。';
+    $('agent-plan-text').textContent='配置生成未完成，保留本条输入，可重试。';
     $('agent-plan-questions').textContent=error.message;
     $('agent-plan-questions').classList.add('has-warning');
+    renderAgentHistory();
     throw error;
   }finally{
     clearInterval(waitingTimer);
-    $('agent-plan').disabled=false;
-    $('agent-plan').textContent='生成配置';
+    if(isCurrent()){state.busy=false;syncAgentComposer();$('agent-prompt').focus();}
   }
  });
- function applyAgentConfig(){if(!agentConfig)throw new Error('请先生成配置');if(!agentConfig.heat_sources?.length)throw new Error('草案缺少热源，请重新生成配置。');if(agentConfig.model_id!==cfg.model_id)throw new Error('模型已改变，请重新生成配置。');cfg=clone(agentConfig);dirty=true;result=null;temperatures=null;jobId=null;activeRegion=-1;activeHeat=0;activeCooling=0;syncFields();setView('setup');}
+ function applyAgentConfig(){if(agentConversation?.busy||$('agent-prompt').value.trim())throw new Error('请先发送补充并完成参数核对');if(!agentConfig)throw new Error('请先生成配置');if(!agentConfig.heat_sources?.length)throw new Error('草案缺少热源，请重新生成配置。');if(agentConfig.model_id!==cfg.model_id)throw new Error('模型已改变，请重新生成配置。');cfg=clone(agentConfig);agentConversation.anchor=JSON.stringify(cfg);dirty=true;result=null;temperatures=null;jobId=null;activeRegion=-1;activeHeat=0;activeCooling=0;syncFields();setView('setup');}
  $('agent-apply').onclick=protect(async()=>{applyAgentConfig();agentRunning=false;agentTraceSet(3,'done','配置已应用，可在主界面修改后确认');$('agent-dialog').hidden=true;toast('Agent 配置已应用，请检查或修改参数后点击“运行仿真”');});
  $('agent-confirm').onclick=protect(async()=>{applyAgentConfig();agentRunning=true;agentTraceSet(4,'active','用户已确认，正在提交任务');$('agent-dialog').hidden=true;toast('已确认 Agent 配置，开始运行仿真');$('run').click();});
 $('export-config').onclick=()=>{if(!cfg)return;const url=URL.createObjectURL(new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'})),a=document.createElement('a');a.href=url;a.download='thermal-config.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};

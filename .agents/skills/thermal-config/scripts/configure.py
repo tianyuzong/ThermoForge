@@ -23,7 +23,8 @@ def main():
     from schemas import AgentRequest
     request = json.loads(Path(args.input).read_text(encoding='utf-8-sig'))
     validated_request = AgentRequest.model_validate(request)
-    prepared = prepare(agent, validated_request.model_id, validated_request.prompt, validated_request.config)
+    prepared = prepare(agent, validated_request.model_id, validated_request.prompt, validated_request.config,
+                       validated_request.conversation())
     if args.action == 'prepare':
         result = prepared['public']
     else:

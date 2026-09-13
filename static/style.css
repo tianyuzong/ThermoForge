@@ -13,3 +13,5 @@
 .playback>label.timeline-control{flex:1}
 .playback-fps{width:112px;flex-shrink:0}
 .playback-fps input{width:70px;margin:0 4px;padding:6px 7px;font-size:12px}
+
+.agent-sheet{width:min(660px,100%);max-height:calc(100vh - 40px)}.agent-conversation-bar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:10px 0}.agent-conversation-bar .hint{margin:0}.agent-conversation-bar button{flex-shrink:0}.agent-history{max-height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;margin:14px 0;padding:4px}.agent-history[hidden]{display:none}.agent-message{padding:10px 13px;border-radius:10px;background:#f3f6fa;line-height:1.65;overflow-wrap:anywhere}.agent-message.user{background:#eaf2ff;margin-left:36px}.agent-message.assistant{margin-right:18px}.agent-message strong{display:block;font-size:11px;color:#536982;margin-bottom:4px}.agent-message div{white-space:pre-wrap;font-size:12px}#agent-composer{margin-top:16px}#agent-composer textarea{min-height:90px}#agent-plan-box{margin-bottom:16px}

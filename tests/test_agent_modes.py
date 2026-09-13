@@ -13,7 +13,7 @@ from schemas import AgentRequest, Simulation
 
 @pytest.fixture
 def prepared_cli(monkeypatch):
-    def prepare(engine, model_id, prompt, current):
+    def prepare(engine, model_id, prompt, current, conversation=None):
         original = Simulation(model_id=model_id, **{k:v for k,v in current.items() if k != 'model_id'}).model_dump()
         return dict(model_id=model_id, original=original, candidate=original, warnings=[], public={},
                     selectors={'top': {'faces':[0], 'face_count':1}})
