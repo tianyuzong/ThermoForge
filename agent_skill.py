@@ -43,6 +43,8 @@ def prepare(engine, model_id, prompt, current):
                   current=compact(original, 'current'), candidate=compact(candidate['config'], 'candidate'),
                   available_selections=public_selectors,
                   rule_questions=candidate.get('questions', []), rule_warnings=candidate.get('warnings', []))
+    from agent_parameters import parameter_contract
+    public['parameter_contract'] = parameter_contract()
     if re.search(r'中心|中间|中部|中央|正中', prompt):
         center = [(a+b)/2 for a,b in zip(*metadata['bounds_m'])]
         public['geometry'].update(center_m=center, center_in_solid=engine._point_in_solid(model_id, center))

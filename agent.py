@@ -339,48 +339,8 @@ def _validated_codex_text(text, current, model_id=None):
 
 
 def _codex_changes(config, current=None):
-    current = current or {}
-    changes = []
-    labels = {
-        'name': '算例名称', 'analysis_mode': '分析类型',
-        'initial_C': '初始温度 (°C)', 'ambient_C': '环境温度 (°C)',
-        'default_h': '默认换热系数 W/(m²·K)', 'heat_convection': '热源面参与默认对流',
-        'radiation_enabled': '表面辐射', 'radiation_ambient_C': '辐射环境温度 (°C)', 'emissivity': '发射率',
-        'air_gap_enabled': '空气间隙耦合', 'air_gap_k_W_mK': '空气导热系数 W/(m·K)',
-        'air_gap_max_m': '最大空气间隙 (m)', 'contact_resistance_m2K_W': '接触热阻 m²·K/W',
-        'duration_s': '仿真时长 (s)', 'dt_s': '计算步长 (s)', 'save_s': '保存间隔 (s)', 'mesh_size_m': '网格尺寸 (m)',
-    }
-    for key, label in labels.items():
-        if config.get(key) != current.get(key):
-            value = config.get(key)
-            changes.append(f'{label}：' + ('开启' if value is True else '关闭' if value is False else str(value)))
-    if config['base_material'] != current.get('base_material'):
-        m = config['base_material']
-        changes.append(f'基础材料：{m["name"]}；k={m["k"]:g} W/(m·K)，ρ={m["rho"]:g} kg/m³，cp={m["cp"]:g} J/(kg·K)')
-    for key, label in [('component_materials', '组件材料'), ('regions', '材料区域')]:
-        if config.get(key) != current.get(key, []):
-            changes.append(label + '：' + '；'.join(
-                f'组件 {r["component_id"]+1}: {r["material"]["name"]}' if key == 'component_materials'
-                else f'{r["name"]}: {r["material"]["name"]}' for r in config.get(key, [])))
-    for index, heat in enumerate(config['heat_sources']):
-        if index < len(current.get('heat_sources', [])) and heat == current['heat_sources'][index]:
-            continue
-        target = (f'{len(heat["faces"])} 个三角面' if heat['source_type'] == 'surface' and heat['placement'] != 'embedded'
-                  else f'点位置 {heat.get("position_m")} m')
-        changes.append(f'热源“{heat["name"]}”：{heat["power_W"]:g} W，{heat["start_s"]:g}–{heat["end_s"]:g} s，{target}')
-        if heat.get('power_profile'):
-            changes.append(f'热源 {index+1} 功率曲线：{json.dumps(heat["power_profile"], ensure_ascii=False)}')
-        if heat.get('thermostat'):
-            changes.append(f'热源 {index+1} 温控：{json.dumps(heat["thermostat"], ensure_ascii=False)}')
-    if len(config['heat_sources']) < len(current.get('heat_sources', [])):
-        changes.append(f'热源数量：{len(config["heat_sources"])}')
-    if config.get('cooling') != current.get('cooling', []):
-        for cooling in config.get('cooling', []):
-            changes.append(f'散热“{cooling["name"]}”：h={cooling["h"]:g} W/(m²·K)，环境 {cooling["ambient_C"]:g} °C，'
-                           f'{len(cooling["faces"])} 个三角面，辐射{"开启" if cooling["radiation"] else "关闭"}')
-        if not config.get('cooling'):
-            changes.append('已清空指定散热区')
-    return changes or ['当前参数无需修改']
+    from agent_parameters import describe_changes
+    return describe_changes(config, current)
 
 
 def _find_codex_cli():
@@ -538,8 +498,9 @@ def _codex_cli_plan_request(model_id, prompt, current, executable):
             return dict(ok=False, config=current or {}, changes=[], warnings=[], questions=questions,
                         mode='codex', provider='cli', workflow='thermal-config', error_code='clarification')
     except Exception as error:
+        from agent_parameters import validation_message
         return dict(ok=False, config=current or {}, changes=[], warnings=[],
-                    questions=[f'Codex 返回的配置无法通过 Simulation 校验：{str(error).split(chr(10))[0]}'],
+                    questions=[f'Codex 返回的配置无法通过 Simulation 校验：{validation_message(error)}'],
                     mode='codex', provider='cli', error_code='invalid_config')
     metrics = dict(elapsed_s=round(time.perf_counter() - started, 3), input_chars=len(cli_prompt),
                    output_chars=len(_cli_response_text(completed.stdout)), tool_calls=0)
