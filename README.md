@@ -1,4 +1,4 @@
-# Thermal Studio
+<h1><img src="static/thermal-studio-logo.png" height="40" alt="Thermal Studio logo" style="vertical-align: middle;"> Thermal Studio</h1>
 
 在本机导入 STL / STEP 模型，设置材料、热源和散热条件，计算并查看三维温度变化。项目包含 Python 仿真服务、浏览器操作界面，以及用于启动服务的 Codex 插件源码。
 
