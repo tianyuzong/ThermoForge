@@ -43,6 +43,13 @@ def prepare(engine, model_id, prompt, current):
                   current=compact(original, 'current'), candidate=compact(candidate['config'], 'candidate'),
                   available_selections=public_selectors,
                   rule_questions=candidate.get('questions', []), rule_warnings=candidate.get('warnings', []))
+    if re.search(r'中心|中间|中部|中央|正中', prompt):
+        center = [(a+b)/2 for a,b in zip(*metadata['bounds_m'])]
+        public['geometry'].update(center_m=center, center_in_solid=engine._point_in_solid(model_id, center))
+        for component in public['geometry']['components']:
+            if component.get('bounds_m') and str(component['component_id']+1) in re.findall(r'(?:组件|部件)\s*(\d+)', prompt):
+                center = [(a+b)/2 for a,b in zip(*component['bounds_m'])]
+                component.update(center_m=center, center_in_solid=engine._point_in_solid(model_id, center))
     return dict(model_id=model_id, original=original, candidate=candidate['config'],
                 selectors=selectors, public=public, warnings=candidate.get('warnings', []))
 

@@ -78,20 +78,65 @@ def _selection_from_text(text):
     return None
 
 
-def _position_from_prompt(model_id, text, faces=None):
+def _position_from_prompt(model_id, text, faces=None, initial=None):
     model=read_json(MODELS/model_id/'metadata.json')
-    lo=np.asarray(model['bounds_m'][0],dtype=float);hi=np.asarray(model['bounds_m'][1],dtype=float)
-    position=(lo+hi)/2
+    bounds = model['bounds_m']
+    component = re.search(r'(?:组件|部件)\s*(\d+)', text)
+    if component:
+        record = next((r for r in model.get('components', []) if r['component_id'] == int(component.group(1))-1), None)
+        if not record or not record.get('bounds_m'):
+            raise ValueError('无法确定该组件的位置，请指定坐标。')
+        bounds = record['bounds_m']
+    lo=np.asarray(bounds[0],dtype=float);hi=np.asarray(bounds[1],dtype=float)
+    center=(lo+hi)/2
+    position=np.asarray(initial,dtype=float).copy() if initial is not None else center.copy()
     found=False
     for match in re.finditer(r'(?<![A-Za-z])([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)',text,re.I):
         axis='xyz'.index(match.group(1).lower());value=float(match.group(2));unit=match.group(3).lower()
         position[axis]=value*(.001 if unit in ('mm','毫米') else .01 if unit in ('cm','厘米') else 1);found=True
     if found:return position.tolist()
-    if re.search(r'中心|中部|内部中心',text):return position.tolist()
+    if re.search(r'中心|中部|中间|正中|中央',text):
+        if re.search(r'之间|两(?:个|处|侧|边)', text):
+            raise ValueError('关系位置需要明确参照对象，不能直接使用整个模型中心。')
+        selector = _selection_from_text(text)
+        if selector and (selector in ('top','bottom','left','right','front','back') or selector.count(':') == 2):
+            import trimesh
+            selected = _surface_selections(model_id, [selector])[selector]['faces']
+            if not selected:
+                raise ValueError('指定表面没有可用于定位点热源的三角面。')
+            display = read_json(MODELS/model_id/'display.json')
+            surface = trimesh.Trimesh(vertices=np.asarray(display['points']).reshape(-1,3),
+                faces=np.asarray(display['faces']).reshape(-1,3)[selected], process=False)
+            point, _, _ = trimesh.proximity.closest_point_naive(surface, [surface.centroid])
+            return point[0].tolist()
+        return center.tolist()
+    offset = re.search(r'(?:向|往)(左|右|上|下|前|后)(?:侧|边|方)?\s*(?:移动|平移|挪动|挪|移)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)', text, re.I)
+    if offset:
+        if initial is None:
+            raise ValueError('相对移动需要已有点热源的坐标，请先指定位置。')
+        direction, value, unit = offset.groups()
+        axis, sign = {'左':(0,-1),'右':(0,1),'前':(1,-1),'后':(1,1),'下':(2,-1),'上':(2,1)}[direction]
+        position[axis] += sign*float(value)*(.001 if unit.lower() in ('mm','毫米') else .01 if unit.lower() in ('cm','厘米') else 1)
+        return position.tolist()
     if faces:
         centers,_=_display_surface(model_id)
         return centers[np.asarray(faces,dtype=int)].mean(axis=0).tolist()
     return None
+
+
+def _point_in_solid(model_id, position):
+    """Check a point against the closed display solid; None means unverified."""
+    import trimesh
+    display = read_json(MODELS / model_id / 'display.json')
+    mesh = trimesh.Trimesh(vertices=np.asarray(display['points']).reshape(-1, 3),
+                           faces=np.asarray(display['faces']).reshape(-1, 3), process=False)
+    if not mesh.is_watertight:
+        return None
+    if bool(mesh.contains([position])[0]):
+        return True
+    # Boundary points are usable too; ray containment alone excludes them.
+    _, distances, _ = trimesh.proximity.closest_point_naive(mesh, [position])
+    return bool(distances[0] <= max(float(mesh.extents.max()) * 1e-8, 1e-10))
 
 
 def make_plan(model_id, prompt, current):
@@ -222,6 +267,8 @@ def _validate_geometry(model_id, config):
             position = np.asarray(group['position_m'])
             if np.any(position < low - 1e-9) or np.any(position > high + 1e-9):
                 raise ValueError('嵌入热源的位置超出模型范围。')
+            if _point_in_solid(model_id, position) is False:
+                raise ValueError(f'嵌入热源位置 {position.tolist()} m 位于空腔或实体外部；请指定实体内位置，或明确采用外置热源。')
     ids = {r['component_id'] for r in metadata.get('components', [])}
     if any(r['component_id'] not in ids for r in config.get('component_materials', [])):
         raise ValueError('材料设置引用了当前模型不存在的组件。')

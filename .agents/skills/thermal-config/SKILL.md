@@ -32,11 +32,14 @@ configure.py validate --root <工程目录> --input <请求.json> --review <修�
 候选完全符合需求时返回 {"patch":[],"questions":[]}。不得重复整份配置。path 使用 / 分隔的参数路径；value_json 是 JSON 编码的值字符串。可替换数组，或用 /heat_sources/- 追加对象。不能修改 model_id 或填写 faces 数字。
 
 按原始需求修正规则，而非照抄候选；保留用户未要求改变的现有设置。用户指定值必须尊重，包括细网格、热源启停时间和其他已有热源。没有要求改名称时保留名称。
+- 先按热源逐个归纳操作、目标、功率、位置和启停时间，再核对候选。“另加/单独加/再加一个”是追加，不能覆盖已有热源；修改、移动、删除按序号或名称定位。只改位置、时间或半径时仍须处理，未提到的功率和其他热源保持不变。新建时缺少功率要询问，不得套用旧热源或虚构数值。
+- 同一个热源的描述可能跨多个句子；后面的明确改口覆盖该热源对应字段，不影响其他热源。闲聊中的数字不是热源参数。无法确定参数归属时询问，不要将多个热源合成一个。
 - 热源功率 W 与换热系数 W/(m²·K) 分开；1 kW=1000 W，1 mm=0.001 m，1 cm=0.01 m。参数 *_m 用米，时间 *_s 用秒。
 - “顶部加热，全部外表面对流”只给顶部加热；后半句只影响散热。默认对流用 default_h、ambient_C；明确包括受热面时 heat_convection=true，排除时 false。指定局部散热应建立 cooling 选区，不能擅自扩大为默认全表面。
 - 对关闭、不要、不使用等否定词按作用对象解释；例如关闭辐射 radiation_enabled=false，关闭空气间隙 air_gap_enabled=false。启停热源时间与仿真总时长、步长、保存间隔分开。
 - 用 available_selections 的非空键设置 surface_selection。top 等是轴向最外侧选面，不等于上半部分。component:2 是界面组件2全部外表面；component:2:top 是组件2顶部。component_materials 的 component_id 则从0开始。x=0.01 表示米制坐标附近外表面。current:/candidate: 前缀选区只能用于保留相应已有面。未知位置不可换成全部外表面。
 - 点热源使用 source_type="point"、position_m=[x,y,z]，嵌入实体时 placement="embedded"，不需要 surface_selection。不能将点的x/y/z坐标误用作面选区。
+- “整个模型中间/内部中心”可按 geometry.center_m 定位为嵌入点热源；组件中心使用对应组件的 center_m 或 bounds_m 中点。center_in_solid 只描述所属模型/组件的中心，false 表示该中心在空腔或实体外，须询问实体内位置或外置方式，不能移动到最近墙面；null 表示未验证。表面中央的点热源保留本地已计算的表面坐标；局部面热源则须确定受热范围或请求刷选，不能扩大为整个面。“两个组件之间”等关系位置需要明确参照对象。
 - 没有可确定的热源或位置、单位歧义或互相矛盾的要求时，用 questions 简短说明；不要猜测几何或伪造参数。复杂物性可修改 base_material/regions/component_materials，物理字段不明确时说明需要哪些值。
 规则问题可通过修正解决时无需照搬到 questions。返回值随后会经过本地 Schema 与几何校验，生成配置不代表已经仿真。
 <!-- /prepared-review -->

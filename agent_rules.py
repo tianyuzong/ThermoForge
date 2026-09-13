@@ -33,8 +33,12 @@ def time_window(text):
     if match:
         a, u, b, v = match.groups()
         return seconds(a, u or v), seconds(b, v)
-    start = re.search(r'(' + NUMBER + r')\s*(' + TIME_UNIT + r')\s*(?:开始|启动)', text, re.I)
-    end = re.search(r'(' + NUMBER + r')\s*(' + TIME_UNIT + r')\s*(?:停止|结束)', text, re.I)
+    start = re.search(r'(' + NUMBER + r')\s*(' + TIME_UNIT + r')\s*(?:后|时)?\s*(?:开始|启动|开启|打开)', text, re.I)
+    end = re.search(r'(' + NUMBER + r')\s*(' + TIME_UNIT + r')\s*(?:后|时)?\s*(?:停止|结束|关闭|关掉)', text, re.I)
+    if not start:
+        start = re.search(r'(?:开始|启动|开启)(?:时间)?\s*(?:设为|改为|为|=)?\s*(' + NUMBER + r')\s*(' + TIME_UNIT + r')', text, re.I)
+    if not end:
+        end = re.search(r'(?:结束|停止|关闭)(?:时间)?\s*(?:设为|改为|为|=)?\s*(' + NUMBER + r')\s*(' + TIME_UNIT + r')', text, re.I)
     return (seconds(*start.groups()) if start else None, seconds(*end.groups()) if end else None)
 
 
@@ -140,68 +144,9 @@ def make_plan(engine, model_id, prompt, current):
         cfg['initial_C'] = cfg['ambient_C'] = float(both.group(1))
 
     heat_text = heat_context(prompt)
-    power_parts = []
-    for part in clauses(heat_text):
-        matches = list(POWER.finditer(part))
-        if len(matches) > 1 and re.search(r'改为|改成|调到|调整为|调整到', part):
-            matches = matches[-1:]
-        power_parts.extend((part, match) for match in matches)
-    sources = cfg.setdefault('heat_sources', [])
-    if re.search(r'(?:仅|只)保留[^，,。;；\n]*热源|热源[^，,。;；\n]*(?:仅|只)保留|替换全部热源', prompt):
-        sources = cfg['heat_sources'] = []
-    offset = len(sources) if re.search(r'(?:新增|再添加|增加一个).*热源', heat_text) else 0
-    target = re.search(r'第([一二三四五六七八九十\d]+)个热源', heat_text)
-    if target and len(power_parts) == 1:
-        ordinal = target.group(1)
-        offset = int(ordinal)-1 if ordinal.isdigit() else ORDINALS.get(ordinal, -1)
-        if offset < 0 or offset >= len(sources):
-            questions.append('要修改的热源序号不存在。')
-            power_parts = []
-    for index, (part, match) in enumerate(power_parts):
-        slot = offset + index
-        source = copy.deepcopy(sources[slot]) if slot < len(sources) else dict(
-            name=f'热源 {slot+1}', power_W=1, start_s=0, end_s=cfg.get('duration_s', 3600), faces=[])
-        context = heat_text if len(power_parts) == 1 else part
-        source['power_W'] = float(match['value']) * (1000 if match['unit'].lower() in ('kw', '千瓦') else 1)
-        if re.search(r'点热源|点源|point', context, re.I):
-            source['source_type'] = 'point'
-        elif re.search(r'面热源|表面.*(?:施加|加热)|外表面', context):
-            source['source_type'] = 'surface'
-        source.setdefault('source_type', 'surface')
-        if re.search(r'嵌入|内部|embedded', context, re.I):
-            source['placement'] = 'embedded'
-        elif re.search(r'外置|外部|external', context, re.I):
-            source['placement'] = 'external'
-        source.setdefault('placement', 'surface')
-        start, end = time_window(context)
-        # Time windows are often in the clause immediately following a source.
-        if len(power_parts) == 1:
-            start, end = time_window(heat_text)
-        if start is not None:
-            source['start_s'] = start
-        if end is not None:
-            source['end_s'] = end
-        point_like = source['source_type'] == 'point' or source['placement'] == 'embedded'
-        explicit_position = engine._position_from_prompt(model_id, context) if point_like else None
-        try:
-            selected, note = (None, None) if explicit_position is not None else engine._face_selection(model_id, context, model['triangles'])
-        except ValueError as error:
-            selected, note = None, None
-            questions.append(str(error))
-        if selected is not None:
-            source['faces'] = selected
-            if note:
-                changes.append(note)
-        if point_like:
-            position = explicit_position if explicit_position is not None else engine._position_from_prompt(model_id, context, selected)
-            if position is not None:
-                source['position_m'] = position
-            source['faces'] = []
-        if slot < len(sources):
-            sources[slot] = source
-        else:
-            sources.append(source)
-        changes.append(f'热源 {slot+1} 功率: {source["power_W"]:g} W')
+    from agent_heat import update_sources
+    update_sources(engine, model_id, heat_text, cfg, changes, warnings, questions)
+    sources = cfg['heat_sources']
 
     for field, pattern in [('radiation_enabled', r'辐射|radiation'), ('air_gap_enabled', r'空气间隙|间隙耦合')]:
         value = feature_value(prompt, pattern)
