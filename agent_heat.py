@@ -155,6 +155,8 @@ def update_sources(engine, model_id, text, cfg, changes, warnings, questions):
             elif selected is not None:
                 source['faces'] = selected
                 source['position_m'] = None
+                from scenario_cases import box_from_text
+                source['surface_box'] = box_from_text(context)
                 changes.append(note)
         except ValueError as error:
             questions.append(str(error))

@@ -1,5 +1,5 @@
 from runtime import *
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, field_validator
 from typing import Annotated, Literal
 Finite = Annotated[float, Field(allow_inf_nan=False)]
 
@@ -15,6 +15,29 @@ class Material(Strict):
     # backwards compatibility for materials without expansion data.
     thermal_expansion_CTE_per_K: Finite = Field(default=0, ge=0, le=1)
     phase_change: 'PhaseChange | None' = None
+    young_modulus_Pa: Finite | None = Field(default=None, gt=0, le=1e13)
+    poisson_ratio: Finite | None = Field(default=None, gt=-1, lt=.499)
+    yield_strength_Pa: Finite | None = Field(default=None, gt=0, le=1e11)
+    category: Literal['metal','polymer','glass','ceramic','elastomer','composite','other'] = 'other'
+    strength_criterion: Literal['von_mises','principal','none'] = 'von_mises'
+    tensile_strength_Pa: Finite | None = Field(default=None, gt=0, le=1e11)
+    compressive_strength_Pa: Finite | None = Field(default=None, gt=0, le=1e11)
+    reference_temperature_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    valid_min_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    valid_max_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    service_min_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    service_max_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    glass_transition_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    data_source: str = Field(default='', max_length=2000)
+    property_notes: str = Field(default='', max_length=2000)
+
+    @model_validator(mode='after')
+    def valid_ranges(self):
+        for lo,hi in ((self.valid_min_C,self.valid_max_C),(self.service_min_C,self.service_max_C)):
+            if lo is not None and hi is not None and lo>=hi: raise ValueError('材料温区下限必须低于上限')
+        if self.category in ('glass','ceramic') and self.strength_criterion=='von_mises':
+            raise ValueError('玻璃/陶瓷不能使用金属屈服判据，请选择主应力判据或不评估强度')
+        return self
 
 class PhaseChange(Strict):
     melting_C: Finite = Field(ge=-273.15, le=5000)
@@ -33,6 +56,9 @@ PRESETS = [
     dict(name='碳钢（示例）',k=50,rho=7850,cp=470,thermal_expansion_CTE_per_K=12e-6),
     dict(name='不锈钢（示例）',k=16,rho=8000,cp=500,thermal_expansion_CTE_per_K=17.3e-6),
 ]
+from material_catalog import NONMETAL_PRESETS
+for preset in PRESETS: preset['category']='metal'
+PRESETS += NONMETAL_PRESETS
 
 class Region(Strict):
     name: str = Field(default='材料区域',max_length=60)
@@ -48,6 +74,31 @@ class ComponentMaterial(Strict):
     component_id: int = Field(ge=0, le=10000)
     material: Material
 
+class SurfaceBox(Strict):
+    min_m: list[Finite] = Field(min_length=3,max_length=3)
+    max_m: list[Finite] = Field(min_length=3,max_length=3)
+    @model_validator(mode='after')
+    def valid(self):
+        if any(a>b for a,b in zip(self.min_m,self.max_m)):raise ValueError('选区盒坐标下限不能大于上限')
+        return self
+
+class AmbientPoint(Strict):
+    time_s: Finite = Field(ge=0,le=864000)
+    ambient_C: Finite = Field(ge=-273.15,le=5000)
+
+class SurfaceEvaluation(Strict):
+    name: str = Field(default='接触面',max_length=80)
+    faces: list[int] = Field(min_length=1,max_length=500000)
+    @field_validator('faces')
+    @classmethod
+    def nonnegative(cls,faces):
+        if any(f<0 for f in faces):raise ValueError('面编号必须非负')
+        return sorted(set(faces))
+    surface_box: SurfaceBox | None = None
+    maximum_C: Finite | None = None
+    flatness_limit_m: Finite | None = Field(default=None,gt=0)
+    reference_power_W: Finite = Field(default=0,ge=0,le=1e8)
+
 class Heat(Strict):
     name: str = Field(default='热源',max_length=60)
     source_type: Literal['point','surface'] = 'surface'
@@ -56,6 +107,7 @@ class Heat(Strict):
     start_s: Finite = Field(default=0,ge=0)
     end_s: Finite = Field(default=3600,gt=0)
     faces: list[int] = Field(default_factory=list,max_length=500000)
+    surface_box: SurfaceBox | None = None
     position_m: list[Finite] | None = Field(default=None,min_length=3,max_length=3)
     radius_m: Finite = Field(default=.001,gt=0,le=100)
     power_profile: list['PowerPoint'] = Field(default_factory=list,max_length=128)
@@ -87,12 +139,55 @@ class Cooling(Strict):
     h: Finite = Field(ge=0,le=1e6)
     ambient_C: Finite = Field(ge=-273.15,le=5000)
     faces: list[int] = Field(min_length=1,max_length=500000)
+    @field_validator('faces')
+    @classmethod
+    def nonnegative(cls,faces):
+        if any(f<0 for f in faces):raise ValueError('面编号必须非负')
+        return sorted(set(faces))
+    surface_box: SurfaceBox | None = None
     radiation: bool = False
     emissivity: Finite = Field(default=.85,ge=0,le=1)
     @model_validator(mode='after')
     def valid_faces(self):
         if min(self.faces)<0: raise ValueError('无效的面编号')
         self.faces=sorted(set(self.faces)); return self
+
+class StructuralSupport(Strict):
+    name: str = Field(default='固定支撑', max_length=60)
+    faces: list[int] = Field(min_length=1, max_length=500000)
+    axes: Literal['x','y','z','xy','xz','yz','xyz'] = 'xyz'
+
+    @model_validator(mode='after')
+    def valid(self):
+        if min(self.faces)<0: raise ValueError('固定支撑面编号无效')
+        self.faces=sorted(set(self.faces))
+        return self
+
+
+class Structural(Strict):
+    mode: Literal['free','constrained']
+    reference_C: Finite = Field(ge=-273.15, le=5000)
+    supports: list[StructuralSupport] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode='after')
+    def valid(self):
+        if self.mode=='constrained' and not self.supports: raise ValueError('受约束热应力分析必须指定固定支撑选区')
+        if self.mode=='free' and self.supports: raise ValueError('自由热弹性分析不能同时设置固定支撑')
+        return self
+
+
+class DesignLimits(Strict):
+    minimum_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    maximum_C: Finite | None = Field(default=None, ge=-273.15, le=5000)
+    maximum_displacement_m: Finite | None = Field(default=None, gt=0, le=100)
+    strength_safety_factor: Finite = Field(default=1.5, ge=1, le=100)
+
+    @model_validator(mode='after')
+    def valid(self):
+        if self.minimum_C is not None and self.maximum_C is not None and self.minimum_C>=self.maximum_C:
+            raise ValueError('允许最低温度必须低于允许最高温度')
+        return self
+
 
 class Simulation(Strict):
     model_id: str = Field(pattern=r'^[a-zA-Z0-9_-]{1,60}$')
@@ -102,6 +197,12 @@ class Simulation(Strict):
     component_materials: list[ComponentMaterial] = Field(default_factory=list,max_length=64)
     heat_sources: list[Heat] = Field(default_factory=list,max_length=16)
     cooling: list[Cooling] = Field(default_factory=list,max_length=16)
+    structural: Structural | None = None
+    design_limits: DesignLimits | None = None
+    environment_only: bool = False
+    initial_from_job: str | None = Field(default=None,pattern=r'^[a-zA-Z0-9_-]{1,60}$')
+    ambient_profile: list[AmbientPoint] = Field(default_factory=list,max_length=128)
+    surface_evaluation: SurfaceEvaluation | None = None
     analysis_mode: Literal['transient','steady'] = 'transient'
     initial_C: Finite = Field(default=25,ge=-273.15,le=5000)
     ambient_C: Finite = Field(default=25,ge=-273.15,le=5000)
@@ -122,8 +223,26 @@ class Simulation(Strict):
     mesh_size_m: Finite = Field(default=.035,gt=1e-7,le=100)
     @model_validator(mode='after')
     def resources(self):
+        if self.initial_from_job and self.analysis_mode!='transient':raise ValueError('温度场续算仅用于瞬态')
+        if self.ambient_profile:
+            if self.analysis_mode!='transient':raise ValueError('环境温度曲线仅用于瞬态')
+            if self.radiation_enabled or any(c.radiation for c in self.cooling):raise ValueError('环境温度曲线目前仅支持对流，请关闭辐射')
+            if any(c.h>0 and c.ambient_C!=self.ambient_C for c in self.cooling):raise ValueError('环境温度曲线要求各对流区使用同一环境温度')
+            times=[p.time_s for p in self.ambient_profile]
+            if times!=sorted(set(times)) or times[0]!=0 or times[-1]!=self.duration_s:raise ValueError('环境曲线时间须严格递增并覆盖0至仿真结束')
         if self.duration_s/self.dt_s>5000: raise ValueError('单次最多 5000 个时间步，请增大计算步长')
         if self.duration_s/self.save_s>300: raise ValueError('单次最多保存 301 帧，请增大保存间隔')
+        if self.structural:
+            materials=[self.base_material]+[r.material for r in self.regions]+[r.material for r in self.component_materials]
+            for material in materials:
+                if material.young_modulus_Pa is None or material.poisson_ratio is None:
+                    raise ValueError(f'热应力分析：材料“{material.name}”必须提供弹性模量和泊松比')
+                if material.phase_change is not None:
+                    raise ValueError('线弹性热应力不支持相变材料，请关闭结构分析或选择无相变工况')
+        if self.environment_only and self.heat_sources:
+            raise ValueError('纯环境温变工况不能同时包含热源')
+        if self.environment_only and not (self.default_h>0 or self.radiation_enabled or any(c.h>0 or c.radiation for c in self.cooling)):
+            raise ValueError('纯环境温变工况必须有对流或辐射换热边界')
         return self
 
 class AgentMessage(Strict):

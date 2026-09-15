@@ -174,3 +174,11 @@ test('an ok response without a heat source cannot enable confirmation', async ()
   assert.equal(p.element('agent-confirm').disabled, true);
   assert.equal(p.element('agent-apply').disabled, true);
 });
+
+test('explicit environment-only draft enables confirmation without applying it', async () => {
+  const p = page(async () => ({ok:true, config:{model_id:'model-1',heat_sources:[],environment_only:true},questions:[],changes:[]}));
+  await p.element('agent-plan').onclick();
+  assert.equal(p.element('agent-confirm').disabled,false);
+  assert.equal(p.context.agentConfig.environment_only,true);
+  assert.deepEqual(p.context.cfg,p.original);
+});

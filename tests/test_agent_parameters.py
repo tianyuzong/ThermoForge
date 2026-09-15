@@ -16,6 +16,32 @@ def current(blocks):
     return Simulation.model_validate(cfg).model_dump()
 
 
+@pytest.mark.parametrize('applied', [0, 2])
+@pytest.mark.parametrize('prompt', [
+    '第一个热源的温控回差设为2摄氏度',
+    '第一个热源 thermostat：target_C=60、hysteresis_C=2、min_power_W=0、max_power_W=5',
+    '第一个热源温控设置为 {"target_C":60,"hysteresis_C":2,"min_power_W":0,"max_power_W":5}',
+])
+def test_followup_repairs_missing_thermostat_hysteresis(blocks, prompt, applied):
+    cfg=current(blocks)
+    cfg['heat_sources'][0]['thermostat']=dict(target_C=60,min_power_W=0,max_power_W=5)
+    other=copy.deepcopy(cfg)
+    context=dict(history=[dict(role='user',content='启用温控，目标温度60摄氏度，回差2摄氏度，最小功率0W，最大功率5W'),
+                          dict(role='assistant',content='hysteresis_C: Field required')],applied_message_count=applied)
+    result=agent.plan_request('blocks',prompt,cfg,context)
+    assert result['ok'],result['questions']
+    other['heat_sources'][0]['thermostat']['hysteresis_C']=2
+    assert result['config']==other
+
+
+def test_initial_thermostat_accepts_huicha(blocks):
+    cfg=current(blocks)
+    result=agent.plan_request('blocks','第一个热源启用温控，目标温度60摄氏度，回差2摄氏度，最小功率0W，最大功率5W',cfg)
+    assert result['ok'],result['questions']
+    assert result['config']['heat_sources'][0]['thermostat']==dict(target_C=60,hysteresis_C=2,min_power_W=0,max_power_W=5)
+    assert result['config']['heat_sources'][0]['power_W']==20
+
+
 def test_contract_exposes_every_field_including_empty_optional_structures():
     schema=Simulation.model_json_schema()
     contract=parameter_contract()
@@ -96,7 +122,8 @@ def test_material_region_can_be_compiled_with_all_properties(blocks):
     region=dict(name='左块材料区',min_m=[-.03,-.01,-.01],max_m=[-.01,.01,.01],material=dict(name='自定义',k=12,rho=1000,cp=1500,thermal_expansion_CTE_per_K=1e-5,phase_change=dict(melting_C=40,mushy_C=5,latent_J_kg=200000)))
     review=dict(patch=[dict(path='/regions',value_json=json.dumps([region]))],questions=[])
     c,q=agent_skill.compile_review(agent,prepared,json.dumps(review))
-    assert not q and c['regions']==[region] and c['heat_sources']==cfg['heat_sources']
+    from schemas import Region
+    assert not q and c['regions']==[Region.model_validate(region).model_dump()] and c['heat_sources']==cfg['heat_sources']
 
 
 def test_changes_show_optional_fields_and_their_removal(blocks):

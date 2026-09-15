@@ -1,5 +1,5 @@
 from runtime import *
-import csv, time, zipfile
+import csv, time, zipfile, threading, uuid
 import numpy as np
 import trimesh, h5py
 from itertools import combinations
@@ -25,7 +25,44 @@ else:
     _CUPY_IMPORT_ERROR = None
 
 
-def gpu_status():
+_CUDA_PREFLIGHT = {}
+_CUDA_PREFLIGHT_LOCK = threading.Lock()
+
+
+def _cuda_preflight(index):
+    """Compile and execute real kernels once per device/process before meshing."""
+    with _CUDA_PREFLIGHT_LOCK:
+        if index not in _CUDA_PREFLIGHT:
+            try:
+                from cuda_runtime import prepare_nvrtc
+                evidence = prepare_nvrtc()
+                # A unique source prevents a previous disk cache from hiding a
+                # broken NVRTC installation. Do not clear the user's CuPy cache.
+                code = ('extern "C" __global__ void thermal_probe(double* x) {'
+                        'if (threadIdx.x < 4) x[threadIdx.x] = 2.0 * threadIdx.x + 1.0; }'
+                        '// ' + uuid.uuid4().hex)
+                kernel = cp.RawKernel(code, 'thermal_probe')
+                values = cp.empty(4, dtype=cp.float64)
+                kernel((1,), (4,), (values,))
+                cp.cuda.get_current_stream().synchronize()
+                np.testing.assert_array_equal(cp.asnumpy(values), [1., 3., 5., 7.])
+                # Exercise the sparse diagonal, preconditioner and CG path that
+                # previously failed only after geometry and matrix assembly.
+                matrix = diags([-np.ones(3), np.full(4, 3.), -np.ones(3)],
+                               [-1, 0, 1], format='csr')
+                rhs = np.arange(1., 5.)
+                solution = _CudaFactor(matrix).solve(rhs)
+                np.testing.assert_allclose(matrix @ solution, rhs, rtol=1e-8, atol=1e-10)
+                _CUDA_PREFLIGHT[index] = dict(evidence, kernel_test='passed', sparse_test='passed')
+            except Exception as error:
+                _CUDA_PREFLIGHT[index] = dict(error=f'{type(error).__name__}: {error}')
+        result = _CUDA_PREFLIGHT[index]
+        if 'error' in result:
+            raise RuntimeError('CUDA 内核编译/求解自检失败：' + result['error'])
+        return dict(result)
+
+
+def gpu_status(analysis_mode=None):
     """Return the selected numerical device and whether CUDA is usable."""
     requested = os.environ.get('THERMAL_DEVICE', 'auto').strip().lower()
     if requested in ('cpu', 'host'):
@@ -44,22 +81,44 @@ def gpu_status():
         name = cp.cuda.runtime.getDeviceProperties(index)['name']
         if isinstance(name, bytes):
             name = name.decode(errors='replace')
-        return dict(requested=requested, device='cuda', available=True, name=name, index=index)
+        preflight = _cuda_preflight(index)
+        if requested=='auto' and analysis_mode=='transient':
+            return dict(requested=requested,device='cpu',available=True,name=name,index=index,
+                        preflight=preflight,
+                        reason='auto: transient cached CPU factorization; explicit cuda remains available')
+        return dict(requested=requested, device='cuda', available=True, name=name, index=index,
+                    preflight=preflight)
     except Exception as error:
         if requested in ('cuda', 'gpu'):
             raise RuntimeError(f'CUDA requested but unavailable: {error}') from error
         return dict(requested=requested, device='cpu', available=False, name=None, reason=str(error))
 
 
-def _gpu_solver(A, rhs):
-    """Solve an SPD sparse system on CUDA with conjugate gradients."""
-    matrix = cps.csr_matrix(A)
-    vector = cp.asarray(rhs)
-    # Heat capacity, conduction, convection, and radiation form an SPD system.
-    solution, info = cupy_cg(matrix, vector, rtol=1e-8, atol=0.0, maxiter=max(1000, A.shape[0] * 2))
-    if int(info) != 0:
-        raise RuntimeError(f'CUDA sparse solve did not converge (info={int(info)})')
-    return cp.asnumpy(solution)
+class _CudaFactor:
+    """Keep one SPD matrix and Jacobi preconditioner resident for repeated solves."""
+    def __init__(self,A):
+        self.matrix=cps.csr_matrix(A)
+        diagonal=self.matrix.diagonal()
+        if not bool(cp.all(cp.isfinite(diagonal)&(diagonal>0))):
+            raise ValueError('CUDA 热矩阵必须具有有限的正对角元')
+        self.preconditioner=cps.diags(1/diagonal,format='csr')
+        self.previous=None
+
+    def solve(self,rhs):
+        vector=cp.asarray(rhs)
+        # Warm starts affect iterations only, never the physical initial field.
+        solution,info=cupy_cg(self.matrix,vector,x0=self.previous,M=self.preconditioner,
+                             rtol=1e-10,atol=0.0,maxiter=max(1000,self.matrix.shape[0]*2))
+        residual=float(cp.linalg.norm(self.matrix@solution-vector))
+        scale=max(float(cp.linalg.norm(vector)),1e-30)
+        if int(info)!=0 or not np.isfinite(residual) or residual>max(1e-12,scale*1e-8):
+            raise RuntimeError(f'CUDA sparse solve did not converge (info={int(info)}, relative residual={residual/scale:.3g})')
+        self.previous=solution
+        return cp.asnumpy(solution)
+
+
+def _gpu_solver(A,rhs):
+    return _CudaFactor(A).solve(rhs)
 
 @BilinearForm
 def capacity(u,v,w):return w.capacity*u*v
@@ -88,7 +147,7 @@ def _boundary_component_ids(tets, component_id, boundary_faces):
         tets[:, [0, 1, 3]], tets[:, [0, 1, 2]],
     ), axis=0)
     tet_faces.sort(axis=1)
-    tet_faces=np.ascontiguousarray(tet_faces)
+    tet_faces=np.ascontiguousarray(tet_faces,dtype=np.int64)
     owners=np.tile(np.asarray(component_id, dtype=np.int64), 4)
     dtype=np.dtype([('a','<i8'),('b','<i8'),('c','<i8')])
     keys=tet_faces.view(dtype).reshape(-1)
@@ -219,12 +278,22 @@ def assemble(mesh,cfg,display):
             heat_audits.append(dict(name=heat['name'],source_type=source_type,placement=placement,power_W=float(F.sum()),position_m=position.tolist(),radius_m=float(heat.get('radius_m',.001))))
             continue
         selected=np.zeros(len(display['faces']),dtype=bool);selected[heat['faces']]=True
-        hot=selected[ids];is_heat|=hot;hotarea=float((area[:,None]/3*hot).sum())
+        from scenario_cases import clipped_quadrature,box_inside
+        box=heat.get('surface_box')
+        hot=selected[ids]&box_inside(queries.reshape(-1,3,3),box);is_heat|=hot;hotarea=float((area[:,None]/3*hot).sum())
+        if box:
+            candidates=np.arange(len(tri))
+            parent,qb,qw=clipped_quadrature(tri[candidates],box);hotarea=float(qw.sum())
         if hotarea<=0:raise ValueError(f'热源“{heat["name"]}”的选区小于当前网格分辨率，请扩大选区或细化网格。')
-        local=np.einsum('fq,qi->fi',area[:,None]/3*hot*heat['power_W']/hotarea,bary)
-        F=np.bincount(bf.ravel(),weights=local.ravel(),minlength=len(points));loads.append(F)
+        if box:
+            F=np.bincount(bf[candidates[parent]].ravel(),weights=(qb*qw[:,None]*heat['power_W']/hotarea).ravel(),minlength=len(points))
+        else:
+            local=np.einsum('fq,qi->fi',area[:,None]/3*hot*heat['power_W']/hotarea,bary)
+            F=np.bincount(bf.ravel(),weights=local.ravel(),minlength=len(points))
+        loads.append(F)
         stltri=display['points'][display['faces'][heat['faces']]]
         originalarea=float(np.linalg.norm(np.cross(stltri[:,1]-stltri[:,0],stltri[:,2]-stltri[:,0]),axis=1).sum()/2)
+        if box:originalarea=float(clipped_quadrature(stltri,box)[2].sum())
         heat_audits.append(dict(name=heat['name'],source_type=source_type,placement=placement,power_W=float(F.sum()),selected_area_m2=originalarea,mapped_area_m2=hotarea))
     h=np.where(exterior,cfg['default_h'],0.).astype(float)
     ambient=np.full(ids.shape,cfg['ambient_C'])
@@ -234,7 +303,8 @@ def assemble(mesh,cfg,display):
     if not cfg['heat_convection']:h[is_heat]=0
     for cool in cfg['cooling']:
         selected=np.zeros(len(display['faces']),dtype=bool);selected[cool['faces']]=True
-        mask=selected[ids];h[mask]=cool['h'];ambient[mask]=cool['ambient_C']
+        from scenario_cases import box_inside
+        mask=selected[ids]&box_inside(queries.reshape(-1,3,3),cool.get('surface_box'));h[mask]=cool['h'];ambient[mask]=cool['ambient_C']
         radiation[mask]=bool(cool.get('radiation',False));radiation_ambient[mask]=cool['ambient_C'];emissivity[mask]=cool.get('emissivity',.85)
     weights=area[:,None]/3*h
     local=np.einsum('fq,qi,qj->fij',weights,bary,bary)
@@ -302,15 +372,22 @@ def _source_power(source, t0, t1, theta, cfg, state):
     return float(power)
 
 
-def integrate(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambient=None,rad_eps=None,phase_entries=None):
-    device=gpu_status()
+def integrate(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambient=None,rad_eps=None,phase_entries=None,initial_temperature=None):
+    device=gpu_status('transient')
     use_gpu=device['device']=='cuda'
     end=cfg['duration_s'];dt=cfg['dt_s'];save=cfg['save_s']
-    output=np.unique(np.r_[np.arange(0,end,save),end])
+    profile=cfg.get('ambient_profile') or []
+    output=np.unique(np.r_[np.arange(0,end,save),end,[p['time_s'] for p in profile]])
     events=np.r_[0,end,np.arange(0,end,dt),output]
     for heat in cfg['heat_sources']:events=np.r_[events,heat['start_s'],heat['end_s']]
     grid=np.unique(np.round(events[(events>=0)&(events<=end)],10))
     theta=np.zeros(M.shape[0]);mc=np.asarray(M.sum(axis=0)).ravel();cc=np.asarray(C.sum(axis=0)).ravel()
+    if initial_temperature is not None:
+        theta=np.asarray(initial_temperature,dtype=float)-cfg['initial_C']
+        if theta.shape!=(M.shape[0],) or not np.isfinite(theta).all():raise ValueError('续算初始温度场与网格不一致')
+    def environment_load(t):
+        delta=float(np.interp(t,[p['time_s'] for p in profile],[p['ambient_C'] for p in profile]))-cfg['ambient_C'] if profile else 0.
+        return G+cc*delta
     phase_entries=phase_entries or []
     saved=[];stats=[];integrated_in=0.;integrated_loss=0.;max_residual=0.;factor=None;last_key=None;control_state={}
     def stored_energy(values):
@@ -321,7 +398,8 @@ def integrate(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambien
     def snapshot(t):
         energy=stored_energy(theta);saved.append(theta.astype(np.float32))
         stats.append(dict(time_s=float(t),minimum_C=float(theta.min()+cfg['initial_C']),maximum_C=float(theta.max()+cfg['initial_C']),
-            average_C=float(energy/mc.sum()+cfg['initial_C']),stored_energy_J=energy,convective_loss_W=float(cc@theta-G.sum())))
+            average_C=float(energy/mc.sum()+cfg['initial_C']),stored_energy_J=energy,convective_loss_W=float(cc@theta-environment_load(t).sum())))
+    initial_energy=stored_energy(theta)
     snapshot(0);save_index=1
     for i,(t0,t1) in enumerate(zip(grid[:-1],grid[1:])):
         step=round(float(t1-t0),10)
@@ -329,32 +407,32 @@ def integrate(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambien
         phase_extra=sum((entry['extra']*((theta+cfg['initial_C']>=entry['low'])&(theta+cfg['initial_C']<=entry['high'])) for entry in phase_entries),np.zeros_like(theta))
         Meff=M+diags(phase_extra) if np.any(phase_extra) else M
         R,Gr,rad_loss=_radiation_terms(theta,cfg,rad_area,rad_ambient,rad_eps)
-        A=Meff/step+K+C+(R if R is not None else 0)
         key=(step, bool(np.any(phase_extra)), bool(R is not None))
-        if not use_gpu and (R is not None or np.any(phase_extra) or factor is None or key!=last_key):
-            factor=splu(A.tocsc());last_key=key
-        F=G.copy();pin=0.
+        if R is not None or np.any(phase_extra) or factor is None or key!=last_key:
+            A=Meff/step+K+C+(R if R is not None else 0)
+            factor=_CudaFactor(A) if use_gpu else splu(A.tocsc());last_key=key
+        boundary_G=environment_load(t1);F=boundary_G.copy();pin=0.
         for load,source in zip(loads,cfg['heat_sources']):
             power=_source_power(source,t0,t1,theta,cfg,control_state)
             if power and source['power_W']>0:
                 F+=load*(power/source['power_W']);pin+=power
         before=stored_energy(theta)
         rhs=Meff@theta/step+F+(Gr if Gr is not None else 0)
-        theta=_gpu_solver(A,rhs) if use_gpu else factor.solve(rhs)
+        theta=factor.solve(rhs)
         if not np.isfinite(theta).all():raise ValueError('温度求解出现非有限值，请检查物性和网格。')
         rad_loss_new=float((np.asarray(R.diagonal())*(theta-(rad_ambient-cfg['initial_C']))).sum()) if R is not None else 0.
-        loss=float(cc@theta-G.sum())+rad_loss_new
+        loss=float(cc@theta-boundary_G.sum())+rad_loss_new
         integrated_in+=pin*step;integrated_loss+=loss*step
         stored=stored_energy(theta);max_residual=max(max_residual,abs(stored-before-step*(pin-loss)))
         if save_index<len(output) and abs(t1-output[save_index])<1e-7:snapshot(t1);save_index+=1
         if i%10==0:callback(float(t1/end),f'正在计算 {t1:.0f} / {end:.0f} s')
-    balance=integrated_in-integrated_loss-stored_energy(theta)
+    balance=initial_energy+integrated_in-integrated_loss-stored_energy(theta)
     if abs(balance)>max(1.,abs(integrated_in)+abs(integrated_loss))*1e-6:raise ValueError('离散能量平衡检查未通过')
-    return np.array(saved),output,stats,dict(input_energy_J=integrated_in,convective_energy_J=integrated_loss,energy_balance_error_J=balance,maximum_step_residual_J=max_residual)
+    return np.array(saved),output,stats,dict(initial_stored_energy_J=initial_energy,input_energy_J=integrated_in,convective_energy_J=integrated_loss,energy_balance_error_J=balance,maximum_step_residual_J=max_residual)
 
 
 def steady(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambient=None,rad_eps=None):
-    device=gpu_status()
+    device=gpu_status('steady')
     use_gpu=device['device']=='cuda'
     theta=np.zeros(M.shape[0]);mc=np.asarray(M.sum(axis=0)).ravel();F=G.copy()
     for load,source in zip(loads,cfg['heat_sources']):
@@ -366,6 +444,7 @@ def steady(M,K,C,G,loads,cfg,callback=lambda *x:None,rad_area=None,rad_ambient=N
         rhs=F+(Gr if Gr is not None else 0)
         next_theta=_gpu_solver(matrix,rhs) if use_gpu else splu(matrix.tocsc()).solve(rhs)
         callback((iteration+1)/80,f'稳态迭代 {iteration+1} / 80')
+        if R is None:theta=next_theta;break
         if np.max(np.abs(next_theta-theta))<1e-7:theta=next_theta;break
         theta=.65*theta+.35*next_theta
     final_R,final_Gr,_=_radiation_terms(theta,cfg,rad_area,rad_ambient,rad_eps)
@@ -440,7 +519,7 @@ def export_slice(job,axis,value):
     meta=dict(key=key,vertices=len(pts),triangles=len(faces),frames=len(frames),axis=axis,value=value)
     write_json(folder/'manifest.json',meta);return meta
 
-def export_archive(job,mesh,frames,times,labels,displacement=None):
+def export_archive(job,mesh,frames,times,labels,displacement=None,structural=None):
     dest=job/'export';dest.mkdir(exist_ok=True)
     hf=h5py.File(dest/'thermal-fields.h5','w')
     hf.create_dataset('points',data=mesh['points'],compression='gzip',shuffle=True)
@@ -454,30 +533,52 @@ def export_archive(job,mesh,frames,times,labels,displacement=None):
     for i,t in enumerate(times):
         hf.create_dataset(f'temperature/{i}',data=frames[i],compression='gzip',shuffle=True)
         disp_attr = f'<Attribute Name="Displacement_m" AttributeType="Vector" Center="Node"><DataItem Dimensions="{n} 3" NumberType="Float" Precision="4" Format="HDF">thermal-fields.h5:/displacement/{i}</DataItem></Attribute>' if displacement is not None else ''
+        if structural is not None:
+            hf.create_dataset(f'von_mises/{i}',data=structural['von_mises'][i],compression='gzip')
+            hf.create_dataset(f'stress/{i}',data=structural['stress'][i],compression='gzip')
+            disp_attr+=f'<Attribute Name="Von_Mises_Pa" AttributeType="Scalar" Center="Cell"><DataItem Dimensions="{ne}" NumberType="Float" Precision="4" Format="HDF">thermal-fields.h5:/von_mises/{i}</DataItem></Attribute>'
+            # Export six components individually so Voigt ordering is explicit.
+            for axis,key in enumerate(('xx','yy','zz','xy','yz','xz')):
+                hf.create_dataset(f'stress_{key}/{i}',data=structural['stress'][i,:,axis],compression='gzip')
+                disp_attr+=f'<Attribute Name="Stress_{key}_Pa" AttributeType="Scalar" Center="Cell"><DataItem Dimensions="{ne}" NumberType="Float" Precision="4" Format="HDF">thermal-fields.h5:/stress_{key}/{i}</DataItem></Attribute>'
         xml.append(f'<Grid GridType="Uniform"><Time Value="{t:g}"/><Topology TopologyType="Tetrahedron" NumberOfElements="{ne}"><DataItem Dimensions="{ne} 4" NumberType="Int" Precision="4" Format="HDF">thermal-fields.h5:/tetra</DataItem></Topology><Geometry GeometryType="XYZ"><DataItem Dimensions="{n} 3" NumberType="Float" Precision="8" Format="HDF">thermal-fields.h5:/points</DataItem></Geometry><Attribute Name="Temperature_C" AttributeType="Scalar" Center="Node"><DataItem Dimensions="{n}" NumberType="Float" Precision="4" Format="HDF">thermal-fields.h5:/temperature/{i}</DataItem></Attribute>{disp_attr}<Attribute Name="Material_ID" AttributeType="Scalar" Center="Cell"><DataItem Dimensions="{ne}" NumberType="Int" Precision="4" Format="HDF">thermal-fields.h5:/material</DataItem></Attribute></Grid>')
     hf.close();xml.append('</Grid></Domain></Xdmf>');(dest/'temperature.xdmf').write_text('\n'.join(xml),encoding='utf-8')
     with zipfile.ZipFile(job/'result.zip','w',compression=zipfile.ZIP_DEFLATED) as z:
         for name in ('thermal-fields.h5','temperature.xdmf'):z.write(dest/name,name)
-        for name in ('config.json','audit.json','history.csv','report.md','report.pdf'):
+        for name in ('config.json','audit.json','assessment.json','history.csv','report.md','report.pdf'):
             if (job/name).exists(): z.write(job/name,name)
+        for asset in (job/'report-assets').glob('*'):z.write(asset,'report-assets/'+asset.name)
 
 def solve_job(job):
     cfg=read_json(job/'config.json');folder=MODELS/cfg['model_id'];display=dict(np.load(folder/'display.npz'))
-    device=gpu_status()
+    device=gpu_status(cfg.get('analysis_mode','transient'))
     progress(job,'running',5,'准备几何与材料分区')
-    mesh=build_mesh(folder,cfg,job)
+    initial_temperature=None
+    if cfg.get('initial_from_job'):
+        from runtime import JOBS
+        parent=JOBS/cfg['initial_from_job']
+        parent_cfg=read_json(parent/'config.json')
+        if read_json(parent/'status.json').get('phase')!='completed':raise ValueError('续算来源必须是已完成算例')
+        for key in ('model_id','mesh_size_m','base_material','regions','component_materials'):
+            if cfg.get(key)!=parent_cfg.get(key):raise ValueError('续算要求相同几何、网格和材料：'+key)
+        mesh=dict(np.load(parent/'mesh.npz'))
+        initial_temperature=np.load(parent/'temperatures.npy')[-1].copy()
+    else:mesh=build_mesh(folder,cfg,job)
     if 'component_id' not in mesh:
         mesh=dict(mesh);mesh['component_id']=connected_tet_components(mesh['tets'],mesh['points'])
     np.savez_compressed(job/'mesh.npz',**mesh)
     if len(mesh['points'])*(cfg['duration_s']/cfg['save_s']+2)>25000000:raise ValueError('结果规模过大，请增大保存间隔或网格尺寸。')
     progress(job,'running',35,'组装多材料导热、热容量和表面边界')
     M,K,C,G,loads,labels,display_nodes,display_bary,audit,rad_area,rad_ambient,rad_eps,phase_entries=assemble(mesh,cfg,display)
-    progress(job,'running',55,'开始'+('稳态' if cfg.get('analysis_mode')=='steady' else '瞬态')+'计算')
+    progress(job,'running',55,'开始'+('稳态' if cfg.get('analysis_mode')=='steady' else '瞬态')+'温度计算（'+device['device'].upper()+'）')
     callback=lambda fraction,msg:progress(job,'running',55+int(30*fraction),msg)
     if cfg.get('analysis_mode')=='steady':
         theta,times,stats,energy=steady(M,K,C,G,loads,cfg,callback,rad_area,rad_ambient,rad_eps)
     else:
-        theta,times,stats,energy=integrate(M,K,C,G,loads,cfg,callback,rad_area,rad_ambient,rad_eps,phase_entries)
+        theta,times,stats,energy=integrate(M,K,C,G,loads,cfg,callback,rad_area,rad_ambient,rad_eps,phase_entries,initial_temperature)
+    if initial_temperature is not None:
+        audit['continuation']=dict(parent_job=cfg['initial_from_job'],method='identical mesh; saved final nodal temperatures',
+            initial_minimum_C=float(initial_temperature.min()),initial_maximum_C=float(initial_temperature.max()))
     # Report the actual volume average, distinct from the heat-capacity-weighted
     # average used internally for the energy balance in a heterogeneous solid.
     volume_weights=np.bincount(mesh['tets'].ravel(),weights=np.repeat(mesh['tet_volumes']/4,4),minlength=len(mesh['points']))
@@ -486,7 +587,43 @@ def solve_job(job):
     materials_for_expansion=[cfg['base_material']]+[r['material'] for r in cfg['regions']]+[r['material'] for r in cfg.get('component_materials',[])]
     displacement, displacement_magnitude, node_cte, expansion_centroid = thermal_expansion_field(
         mesh, frames, labels, materials_for_expansion, cfg['initial_C'])
+    structural=None
+    if cfg.get('structural'):
+        from thermoelastic import map_supports,solve_thermoelastic
+        fixed,support_audit=map_supports(mesh,display,cfg['structural'].get('supports',[])) if cfg['structural'].get('supports') else ([],[])
+        progress(job,'running',85,'计算三维热弹性位移与应力（CPU）')
+        structural=solve_thermoelastic(mesh,frames,materials_for_expansion,labels,cfg['structural'],fixed,
+            lambda p:progress(job,'running',85+int(2*p),'计算热应力 '+str(round(p*100))+'%'),
+            stage_callback=lambda detail:progress(job,'running',85,detail))
+        structural['summary']['supports']=support_audit
+        displacement=structural['displacement'];displacement_magnitude=np.linalg.norm(displacement,axis=2)
+        structural['stress'].tofile(job/'stress.bin')
+        # Browser surface stress uses the maximum incident cell value before
+        # barycentric projection; raw cell stresses remain in the 3-D export.
+        node_vm=np.zeros((len(frames),len(mesh['points'])),dtype='<f4')
+        for f,vm in enumerate(structural['von_mises']):
+            np.maximum.at(node_vm[f],mesh['tets'].ravel(),np.repeat(vm,4))
+        np.einsum('fvi,vi->fv',node_vm[:,display_nodes],display_bary).astype('<f4').tofile(job/'surface-von-mises.bin')
+        for row,srow in zip(stats,structural['stats']):
+            for key in ('maximum_von_mises_Pa','maximum_principal_Pa','minimum_principal_Pa','relative_equilibrium_residual'):
+                row[key]=srow[key]
+        audit['structural']={**structural['summary'],'stats':structural['stats'],
+            'maximum_von_mises_Pa':float(structural['von_mises'].max()),'maximum_displacement_m':float(displacement_magnitude.max())}
     displacement.tofile(job/'displacement.bin')
+    np.einsum('fvic,vi->fvc',displacement[:,display_nodes],display_bary).astype('<f4').tofile(job/'surface-displacement.bin')
+    from thermoelastic import assess_design
+    assessment=assess_design(cfg,mesh,frames,times,structural,materials_for_expansion,labels)
+    from scenario_cases import surface_metrics
+    evaluation=surface_metrics(mesh,frames,displacement if structural else None,times,cfg,display)
+    if evaluation:
+        audit['surface_evaluation']=evaluation
+        for title,key,limit_key,unit in [('接触面最高温度','maximum_C','temperature_limit_C','°C'),('接触面拟合平面翘曲','maximum_flatness_m','flatness_limit_m','m')]:
+            val,limit=evaluation[key],evaluation[limit_key]
+            status='not_assessed' if val is None or limit is None else 'exceeded' if val>limit else 'within_limits'
+            assessment['checks'].append(dict(name=title,value=val,limit=limit,unit=unit,status=status))
+            if status=='exceeded':assessment['status']='exceeded'
+    write_json(job/'assessment.json',assessment)
+    audit['assessment']=assessment
     for row, mag in zip(stats, displacement_magnitude):
         row['maximum_displacement_m'] = float(np.max(mag))
         row['average_displacement_m'] = float(np.mean(mag))
@@ -501,7 +638,8 @@ def solve_job(job):
         component_points=mesh['points'][mesh['tets'][cells].ravel()]
         length_scale=float(np.max(np.ptp(component_points,axis=0))) if len(component_points) else 0
         diffusivity=float(material['k']/(material['rho']*material['cp'])) if material.get('rho') and material.get('cp') else 0
-        mean_by_frame=values.mean(axis=1)
+        component_weights=np.bincount(mesh['tets'][cells].ravel(),weights=np.repeat(mesh['tet_volumes'][cells]/4,4),minlength=len(mesh['points']))
+        mean_by_frame=frames@component_weights/component_weights.sum()
         peak_rise=float(np.max(mean_by_frame)-cfg['initial_C'])
         half_time=None
         if peak_rise>1e-9:
@@ -510,7 +648,7 @@ def solve_job(job):
         component_rows.append(dict(component_id=int(component),cells=int(cells.sum()),nodes=int(len(node_ids)),volume_m3=float(mesh['tet_volumes'][cells].sum()),
             material_name=material.get('name','未指定'),conductivity_k=float(material.get('k',0)),density_rho=float(material.get('rho',0)),specific_heat_cp=float(material.get('cp',0)),
             thermal_diffusivity_m2_s=diffusivity,diffusion_length_m=length_scale,diffusion_time_estimate_s=float(length_scale**2/diffusivity) if diffusivity>0 else None,
-            minimum_C=float(values.min()),maximum_C=float(values.max()),final_minimum_C=float(values[-1].min()),final_maximum_C=float(values[-1].max()),final_average_C=float(values[-1].mean()),
+            minimum_C=float(values.min()),maximum_C=float(values.max()),final_minimum_C=float(values[-1].min()),final_maximum_C=float(values[-1].max()),final_average_C=float(mean_by_frame[-1]),
             peak_average_rise_C=peak_rise,time_to_half_peak_s=half_time,
             final_maximum_displacement_m=float(displacement_magnitude[-1, node_ids].max()) if len(node_ids) else 0.0,
             peak_maximum_displacement_m=float(displacement_magnitude[:, node_ids].max()) if len(node_ids) else 0.0))
@@ -521,7 +659,15 @@ def solve_job(job):
         material_interface='CAD-conforming box fragments' if read_json(folder/'metadata.json')['kind']=='step' else 'element-centroid assignment; refine mesh at material interfaces',
         assumptions=['constant material properties outside phase-change intervals','smeared interface resistance when configured','prescribed convection coefficient plus optional surface radiation','air gaps use reduced-order conduction k_air*A/gap; no airflow/CFD solve','thermal expansion is reported as unconstrained isotropic free expansion; no stress or mechanical constraint solve'])
     warnings=[]
-    lower_bound=min([cfg['initial_C'],cfg['ambient_C']]+[c['ambient_C'] for c in cfg['cooling']])
+    if structural:
+        audit['thermal_expansion'].update(method='thermoelastic',reference_C=cfg['structural']['reference_C'])
+        audit['assumptions'][-1]='3D quasi-static small-strain thermoelastic FEM; see structural assumptions'
+        if not structural['summary']['small_strain_valid']:warnings.append('热应变或总应变超过1%，超出本线弹性小变形模型的验证范围，需使用非线性结构模型复核。')
+        if any(m.get('thermal_expansion_CTE_per_K',0)==0 for m in materials_for_expansion):warnings.append('部分材料线膨胀系数为0，请核对是否为真实材料参数。')
+        for support in structural['summary']['supports']:
+            if abs(support['mapped_area_m2']/support['selected_area_m2']-1)>.05:
+                warnings.append('固定支撑“'+support['name']+'”网格映射面积偏差超过5%，请细化网格复核约束范围。')
+    lower_bound=min([cfg['initial_C'],cfg['ambient_C']]+[c['ambient_C'] for c in cfg['cooling']]+[p['ambient_C'] for p in cfg.get('ambient_profile',[])]+([float(initial_temperature.min())] if initial_temperature is not None else []))
     undershoot=lower_bound-float(frames.min())
     if undershoot>1e-4:warnings.append(f'最低温度比所有初始/环境温度低 {undershoot:.4f}°C，属于离散数值下冲；请调整网格与时间步长复核。结果未做截断修饰。')
     if float(mesh.get('minimum_quality',1))<.05:warnings.append('局部存在形状质量较低的网格单元，请通过网格加密比较确认热点精度。')
@@ -549,42 +695,22 @@ def solve_job(job):
     write_json(job/'audit.json',audit)
     with (job/'history.csv').open('w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=stats[0].keys());writer.writeheader();writer.writerows(stats)
-    manifest=dict(times_s=times.tolist(),vertices=surface.shape[1],frames=len(times),minimum_C=float(frames.min()),maximum_C=float(frames.max()),
+    manifest=dict(analysis_mode=cfg.get('analysis_mode','transient'),times_s=times.tolist(),vertices=surface.shape[1],frames=len(times),minimum_C=float(frames.min()),maximum_C=float(frames.max()),
         displacement_vertices=int(displacement.shape[1]), displacement_frames=int(displacement.shape[0]),
         maximum_displacement_m=float(displacement_magnitude.max()), final_maximum_displacement_m=float(displacement_magnitude[-1].max()),
         thermal_expansion=dict(reference_C=float(cfg['initial_C']), centroid_m=expansion_centroid.tolist(),
             max_displacement_m=float(displacement_magnitude.max()), cte_min_per_K=float(node_cte.min()), cte_max_per_K=float(node_cte.max())),
-        stats=stats,summary=audit)
+        structural=audit.get('structural'),assessment=assessment,stats=stats,summary=audit)
     write_json(job/'result.json',manifest)
     write_report(job,cfg,folder,audit,energy)
     progress(job,'running',88,'生成内部剖面和完整结果文件')
     bounds=np.array(read_json(folder/'metadata.json')['bounds_m']);export_slice(job,0,float(bounds[:,0].mean()))
-    export_archive(job,mesh,frames,times,labels,displacement)
+    export_archive(job,mesh,frames,times,labels,displacement,structural)
     progress(job,'completed',100,'计算完成',finished_at=time.time())
 
 def write_report(job,cfg,folder,audit,energy):
-    """Write a portable human-readable report beside the machine-readable outputs."""
-    lines=['# Thermal Studio 仿真报告','',f'- 模型：{read_json(folder/"metadata.json").get("name", folder.name)}',f'- 算例：{cfg["name"]}',f'- 分析：{"稳态" if cfg.get("analysis_mode")=="steady" else "瞬态"}',f'- 计算设备：{audit.get("device",{}).get("device", "cpu")}', '']
-    lines+=['## 组件与温度','', '| 组件 | 材料 | 导热系数 k | 热扩散率 α (m²/s) | 特征扩散时间 L²/α (s) | 末帧平均 (°C) | 平均升温峰值 (°C) | 达到峰值 50% (s) |','|---|---|---:|---:|---:|---:|---:|---:|']
-    for row in audit.get('components',[]):
-        half='-' if row.get('time_to_half_peak_s') is None else f'{row["time_to_half_peak_s"]:.1f}'
-        diffusion_time='-' if row.get('diffusion_time_estimate_s') is None else f'{row["diffusion_time_estimate_s"]:.3g}'
-        lines.append(f'| 组件 {row["component_id"]+1} | {row.get("material_name","未指定")} | {row.get("conductivity_k",0):.6g} | {row.get("thermal_diffusivity_m2_s",0):.6g} | {diffusion_time} | {row["final_average_C"]:.2f} | {row.get("peak_average_rise_C",0):.2f} | {half} |')
-    lines+=['','组件温度范围：最低/最高温度与末帧平均温度已写入 `audit.json`；`α = k/(ρ·cp)` 越大，材料内部温度扰动理论上传播越快。']
-    expansion=audit.get('thermal_expansion',{})
-    lines+=['','## 热胀冷缩','',f'- 状态：{"启用" if expansion.get("enabled") else "未提供线膨胀系数"}',f'- 参考温度：{float(expansion.get("reference_C",cfg.get("initial_C",25))):g} °C',f'- 最大自由热位移：{float(expansion.get("maximum_displacement_m",0))*1000:.6g} mm', '- 位移场写入 `displacement.bin`；结果为无约束各向同性自由膨胀近似，不包含应力/约束反力。','', '## 时间与热源','',f'- 仿真时长：{float(cfg["duration_s"]):g} s',f'- 计算步长：{float(cfg["dt_s"]):g} s，保存间隔：{float(cfg["save_s"]):g} s']
-    for heat in cfg.get('heat_sources',[]):lines.append(f'- 热源“{heat["name"]}”：{float(heat["power_W"]):g} W，作用时间 {float(heat["start_s"]):g}–{float(heat["end_s"]):g} s')
-    lines+=['','## 材料','', '| 材料 | 导热系数 k | 密度 | 比热容 | 线膨胀系数 (1/K) | 热扩散率 α (m²/s) | 体积 (m³) |','|---|---:|---:|---:|---:|---:|---:|']
-    for material in audit.get('materials',[]):
-        diffusivity=material["k"]/(material["rho"]*material["cp"]) if material.get("rho") and material.get("cp") else 0
-        lines.append(f'| {material["name"]} | {material["k"]:.6g} | {material["rho"]:.6g} | {material["cp"]:.6g} | {material.get("thermal_expansion_CTE_per_K",0):.6g} | {diffusivity:.6g} | {material.get("volume_m3",0):.6g} |')
-    lines+=['','## 能量与数值检查',f'- 输入能量：{energy.get("input_energy_J",0):.6g} J',f'- 对流/辐射损失：{energy.get("convective_energy_J",0):.6g} J',f'- 能量平衡误差：{energy.get("energy_balance_error_J",0):.6g} J',f'- 网格节点：{audit.get("nodes",0)}，四面体：{audit.get("tetrahedra",0)}']
-    gap=audit.get('air_gap',{})
-    lines+=['','## 空气间隙传热',f'- 状态：{"启用" if gap.get("enabled") else "关闭"}',f'- 空气导热系数：{float(gap.get("k_air_W_mK",cfg.get("air_gap_k_W_mK",.026))):.6g} W/(m·K)',f'- 最大建模间隙：{float(gap.get("max_gap_m",cfg.get("air_gap_max_m",.05))):.6g} m',f'- 表面耦合对数：{int(gap.get("pairs",0))}',f'- 有效耦合面积：{float(gap.get("area_m2",0)):.6g} m²',f'- 总空气导热系数：{float(gap.get("conductance_W_K",0)):.6g} W/K']
-    if audit.get('warnings'):lines+=['','## 警告']+ [f'- {warning}' for warning in audit['warnings']]
-    report_text='\n'.join(lines)+'\n'
-    (job/'report.md').write_text(report_text,encoding='utf-8')
-    write_report_pdf(job/'report.pdf', report_text)
+    from engineering_report import write_engineering_report
+    write_engineering_report(job,cfg,read_json(folder/'metadata.json'),audit,write_report_pdf)
 
 
 def write_report_pdf(path, text):
@@ -594,7 +720,7 @@ def write_report_pdf(path, text):
         from reportlab.lib import colors
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
         from xml.sax.saxutils import escape
@@ -612,17 +738,28 @@ def write_report_pdf(path, text):
                 except Exception:
                     pass
         styles=getSampleStyleSheet()
-        body=ParagraphStyle('ThermalBody', parent=styles['BodyText'], fontName=font_name, fontSize=8.5, leading=12, spaceAfter=4)
+        body=ParagraphStyle('ThermalBody', parent=styles['BodyText'], fontName=font_name, fontSize=8.5, leading=12, spaceAfter=4,wordWrap='CJK')
         heading=ParagraphStyle('ThermalHeading', parent=body, fontSize=13, leading=17, spaceBefore=8, spaceAfter=5)
-        subheading=ParagraphStyle('ThermalSubheading', parent=body, fontSize=10, leading=13, spaceBefore=7, spaceAfter=3)
+        subheading=ParagraphStyle('ThermalSubheading', parent=body, fontSize=10, leading=13, spaceBefore=7, spaceAfter=3, keepWithNext=True)
         bullet=ParagraphStyle('ThermalBullet', parent=body, leftIndent=10, firstLineIndent=-7)
         def inline(value):
+            value=value.replace('²','^2').replace('³','^3')
             value=escape(value.replace('`',''))
             return re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', value)
         story=[]; lines=text.splitlines(); i=0
         while i<len(lines):
             raw=lines[i].strip()
-            if not raw: story.append(Spacer(1,3)); i+=1; continue
+            # Paragraph styles already supply spacing. Blank-line spacers can
+            # overflow to an otherwise empty page just before a page break.
+            if not raw: i+=1; continue
+            if raw=='<!-- pagebreak -->':story.append(PageBreak());i+=1;continue
+            picture=re.fullmatch(r'!\[([^\]]*)\]\(([^)]+)\)',raw)
+            if picture:
+                asset=(path.parent/picture.group(2)).resolve()
+                if not asset.is_relative_to((path.parent/'report-assets').resolve()) or not asset.is_file():
+                    raise ValueError('报告图像不存在或路径无效：'+picture.group(2))
+                img=Image(str(asset));img.drawHeight*=180*mm/img.drawWidth;img.drawWidth=180*mm
+                story.append(img);i+=1;continue
             if raw.startswith('|'):
                 rows=[]
                 while i<len(lines) and lines[i].strip().startswith('|'):
@@ -631,20 +768,23 @@ def write_report_pdf(path, text):
                     i+=1
                 if rows:
                     width=max(len(r) for r in rows); rows=[r+['']*(width-len(r)) for r in rows]
-                    table=Table([[Paragraph(inline(c),body) for c in r] for r in rows], repeatRows=1, hAlign='LEFT')
+                    table=Table([[Paragraph(inline(c),body) for c in r] for r in rows], colWidths=[180*mm/width]*width, repeatRows=1, hAlign='LEFT')
                     table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e9eef3')),('GRID',(0,0),(-1,-1),.25,colors.HexColor('#aab4bf')),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)])); story.append(table); story.append(Spacer(1,5))
                 continue
             if raw.startswith('## '): story.append(Paragraph(inline(raw[3:]),subheading))
             elif raw.startswith('# '): story.append(Paragraph(inline(raw[2:]),heading))
-            elif raw.startswith('- '): story.append(Paragraph('• '+inline(raw[2:]),bullet))
+            elif raw.startswith('- '): story.append(Paragraph('- '+inline(raw[2:]),bullet))
             else: story.append(Paragraph(inline(raw),body))
             i+=1
         doc=SimpleDocTemplate(str(path),pagesize=A4,rightMargin=15*mm,leftMargin=15*mm,topMargin=14*mm,bottomMargin=14*mm,title='Thermal Studio 仿真报告')
-        doc.build(story)
+        def footer(canvas,doc):
+            canvas.setFont(font_name,8);canvas.setFillColor(colors.HexColor('#667085'))
+            canvas.drawString(15*mm,8*mm,'Thermal Studio | 工程筛查 · 需实测验证')
+            canvas.drawRightString(195*mm,8*mm,str(doc.page))
+        doc.build(story,onFirstPage=footer,onLaterPages=footer)
         return
-    except Exception:
-        pass
-    _write_basic_pdf(path, text)
+    except Exception as error:
+        raise RuntimeError("PDF 报告生成失败："+str(error)) from error
 
 
 def _write_basic_pdf(path, text):

@@ -56,11 +56,14 @@ def _face_selection(model_id, text, triangles):
 
 
 def _selection_from_text(text):
+    from scenario_cases import box_from_text,box_token
+    box=box_from_text(text)
+    if box:return box_token(box)
     lower = text.lower()
     component = re.search(r'(?:组件|部件)\s*(\d+)', text)
     coordinate = re.search(r'(?<![A-Za-z])([xyz])\s*(?:=|为|在)\s*(-?\d+(?:\.\d+)?)\s*(mm|毫米|cm|厘米|m|米)', text, re.I)
     directions = [
-        (r'\+z|顶部|上表面|上方', 'top'), (r'-z|底部|下表面|下方', 'bottom'),
+        (r'\+z|顶部|顶面|上表面|上方', 'top'), (r'-z|底部|底面|下表面|下方', 'bottom'),
         (r'\+x|右侧|右边', 'right'), (r'-x|左侧|左边', 'left'),
         (r'\+y|后侧|后面|后方', 'back'), (r'-y|前侧|前面|前方', 'front'),
     ]
@@ -192,15 +195,13 @@ def _json_from_text(text):
 def _surface_selections(model_id, requested=()):
     """Resolve shared semantic selectors without asking a model to invent IDs."""
     folder = MODELS / model_id
-    display = read_json(folder / 'display.json')
-    points = np.asarray(display['points'], dtype=float).reshape(-1, 3)
-    faces = np.asarray(display['faces'], dtype=np.int64).reshape(-1, 3)
+    from host_geometry import surface
+    points, faces, outer, _ = surface(folder)
     tri = points[faces]
     centers = tri.mean(axis=1)
     cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     lengths = np.linalg.norm(cross, axis=1)
     normals = cross / np.maximum(lengths[:, None], 1e-30)
-    outer = np.asarray(display.get('is_outer', np.ones(len(faces))), dtype=bool)
     valid = outer & (lengths > 0)
     selections = {}
 
@@ -247,6 +248,14 @@ def _surface_selections(model_id, requested=()):
         add(key, f'组件 {index+1} 外表面', mask)
         directions(key + ':', f'组件 {index+1} ', mask)
     for selector in requested:
+        from scenario_cases import token_box,clipped_quadrature
+        box=token_box(selector or '')
+        if box:
+            parents,_,weights=clipped_quadrature(tri,box)
+            mask=np.zeros(len(faces),bool);mask[np.unique(parents)]=True;mask &= valid
+            add(selector,'空间裁剪选区',mask)
+            selections[selector].update(surface_box=box,area_m2=float(weights[valid[parents]].sum()))
+            continue
         match = re.fullmatch(r'([xyz])=(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', selector or '')
         if not match:
             continue
@@ -259,7 +268,8 @@ def _surface_selections(model_id, requested=()):
 
 
 def _requested_selections(prompt):
-    tokens = []
+    from scenario_cases import BOX,box_from_text,box_token
+    tokens = [box_token(box_from_text(m.group())) for m in BOX.finditer(prompt)]
     for match in re.finditer(r'(?<![A-Za-z])[xyz]\s*(?:=|为|在)\s*-?\d+(?:\.\d+)?\s*(?:mm|毫米|cm|厘米|m|米)', prompt, re.I):
         token = _selection_from_text(match.group())
         if token:
@@ -269,7 +279,7 @@ def _requested_selections(prompt):
 
 def _validate_geometry(model_id, config):
     metadata = read_json(MODELS / model_id / 'metadata.json')
-    for group in [*config.get('heat_sources', []), *config.get('cooling', [])]:
+    for group in [*config.get('heat_sources', []), *config.get('cooling', []), *(config.get('structural') or {}).get('supports',[]), *([config['surface_evaluation']] if config.get('surface_evaluation') else [])]:
         if group.get('faces') and max(group['faces']) >= metadata['triangles']:
             raise ValueError('Agent 返回了当前模型不存在的面编号，请重新选取。')
         if group.get('placement') == 'embedded' and group.get('position_m') and metadata.get('bounds_m'):
@@ -300,10 +310,12 @@ def _codex_context(model_id, prompt, current):
     # The assistant uses semantic selectors; the solver still receives only
     # ordinary Simulation fields with resolved triangle IDs.
     selector = dict(type='string', enum=[x['id'] for x in geometry['surface_selections']])
-    for name in ('Heat', 'Cooling'):
+    for name in ('Heat', 'Cooling', 'StructuralSupport', 'SurfaceEvaluation'):
         schema['$defs'][name]['properties']['surface_selection'] = selector
     schema['$defs']['Cooling']['required'] = [key for key in schema['$defs']['Cooling']['required'] if key != 'faces']
-    schema['properties']['heat_sources']['minItems'] = 1
+    schema['$defs']['StructuralSupport']['required'] = [key for key in schema['$defs']['StructuralSupport']['required'] if key != 'faces']
+    schema['$defs']['SurfaceEvaluation']['required'] = [key for key in schema['$defs']['SurfaceEvaluation']['required'] if key != 'faces']
+    schema['properties']['heat_sources']['minItems'] = 0 if (current or {}).get('environment_only') or re.search(r'纯环境|无热源.*(?:环境|高低温)',prompt) else 1
     schema['required'] = list(dict.fromkeys([*schema.get('required', []), 'heat_sources']))
     return schema, geometry
 
@@ -327,10 +339,10 @@ def _validated_codex_text(text, current, model_id=None):
         raise ValueError('Agent 返回了其他模型的配置，请为当前模型重新生成。')
     if expected_model:
         config['model_id'] = expected_model
-    if not config.get('heat_sources'):
+    if not config.get('heat_sources') and not config.get('environment_only'):
         raise ValueError('草案未生成热源。请明确功率与受热面，或指定点热源位置；当前草案不能运行。')
     selections = None
-    for group in [*config.get('heat_sources', []), *config.get('cooling', [])]:
+    for group in [*config.get('heat_sources', []), *config.get('cooling', []), *(config.get('structural') or {}).get('supports',[]), *([config['surface_evaluation']] if config.get('surface_evaluation') else [])]:
         selector = group.pop('surface_selection', None)
         if selector is None:
             continue
@@ -342,6 +354,7 @@ def _validated_codex_text(text, current, model_id=None):
         if group.get('faces') and sorted(set(group['faces'])) != selected:
             raise ValueError('Agent 的选区名称与面编号冲突，请重新生成或手动刷选。')
         group['faces'] = selected
+        if selections[selector].get('surface_box'):group['surface_box']=selections[selector]['surface_box']
     validated = Simulation.model_validate(config)
     if model_id:
         _validate_geometry(model_id, validated.model_dump(mode='json'))
@@ -546,7 +559,7 @@ def _codex_api_plan_request(model_id, prompt, current, conversation=None):
     instructions = (
         '你是 Thermal Studio 的仿真配置助手。根据用户描述生成完整、可执行的 Simulation JSON 配置。'
         '只输出一个 JSON 对象，不要 Markdown、解释或额外字段。必须符合给定 JSON Schema；'
-        '保留当前配置中未被用户修改的字段与 model_id。必须生成至少一个有效热源。'
+        '保留当前配置中未被用户修改的字段与 model_id。通常须有有效热源；明确的纯环境温变工况可设置environment_only=true并使用空heat_sources。'
         '新增或修改受热面时使用 geometry.surface_selections 中非空选区的 id，写入 surface_selection 字段，'
         '例如顶部热源使用 surface_selection="top"，由本地后端生成 faces；不要猜测面编号。'
         '热源与散热面分别处理，全部外表面对流使用 default_h 与 heat_convection。用户确认由网页处理，只返回配置。'

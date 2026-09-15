@@ -15,6 +15,17 @@ MATERIAL_FIELDS = {
     'rho': (r'密度|\brho\b|ρ', 'density'),
     'cp': (r'比热容?|\bcp\b', 'specific_heat'),
     'thermal_expansion_CTE_per_K': (r'(?:线|热)?膨胀系数|\bCTE\b', 'expansion'),
+    'young_modulus_Pa': (r'弹性模量|杨氏模量|\byoung_modulus_Pa\b','stress'),
+    'poisson_ratio': (r'泊松比|\bpoisson_ratio\b','plain'),
+    'yield_strength_Pa': (r'屈服强度|\byield_strength_Pa\b','stress'),
+    'tensile_strength_Pa': (r'抗拉强度|拉伸强度|\btensile_strength_Pa\b','stress'),
+    'compressive_strength_Pa': (r'抗压强度|压缩强度|\bcompressive_strength_Pa\b','stress'),
+    'reference_temperature_C': (r'物性参考温度|材料参考温度|\breference_temperature_C\b','temperature'),
+    'valid_min_C': (r'物性有效最低温度|\bvalid_min_C\b','temperature'),
+    'valid_max_C': (r'物性有效最高温度|\bvalid_max_C\b','temperature'),
+    'service_min_C': (r'材料最低使用温度|材料使用温度下限|\bservice_min_C\b','temperature'),
+    'service_max_C': (r'材料最高使用温度|材料使用温度上限|\bservice_max_C\b','temperature'),
+    'glass_transition_C': (r'玻璃化转变温度|\bTg\b|\bglass_transition_C\b','temperature'),
 }
 PHASE_FIELDS = {'melting_C':(r'起熔温度|熔化温度|熔点','temperature'),
                 'mushy_C':(r'相变温区(?:宽度)?|糊状区(?:宽度)?','difference'),
@@ -34,6 +45,7 @@ ROOT_FIELDS = {
     'mesh_size_m': (r'网格(?:尺寸|大小)?|\bmesh\b','length'),
 }
 UNIT = dict(time=TIME,length=LENGTH,temperature=TEMP,difference=TEMP,
+            stress=r'GPa|MPa|kPa|Pa|吉帕|兆帕|帕',
             power=r'kW|W|千瓦|瓦',
             conductivity=r'kW\s*/?\s*\(?m|W\s*/?\s*\(?m',
             density=r'g\s*/\s*cm[³3]|kg\s*/\s*m[³3]',
@@ -45,6 +57,7 @@ CURVE_POINT = re.compile('('+NUMBER+r')\s*('+TIME+r')\s*(?:[:：=]|时(?:功率)
 
 def normalize(text):
     text=text.replace('摄氏度','°C').replace('摄氏','°C').replace('℃','°C')
+    text=re.sub(r'负(?=\d)','-',text)
     text=re.sub(r'(\d+(?:\.\d+)?)\s*[×*]\s*10\s*\^?\s*([+-]?\d+)', r'\1e\2', text)
     def split_clear(match):
         verb,body=match.groups()
@@ -71,6 +84,7 @@ def value(text, alias, kind):
     if kind=='power' and suffix in ('kw','千瓦'): number*=1000
     if kind=='expansion' and suffix.startswith('ppm'): number*=1e-6
     if kind=='resistance' and suffix.startswith('mm'): number*=1e-6
+    if kind=='stress': number*=1e9 if suffix in ('gpa','吉帕') else 1e6 if suffix in ('mpa','兆帕') else 1e3 if suffix=='kpa' else 1
     return number
 
 
@@ -102,7 +116,7 @@ def update_materials(prompt, cfg, model, questions):
         component=re.search(r'(?:组件|部件)\s*(\d+)',part)
         explicit_base=bool(re.search(r'基础材料|全局材料|整个模型.*材料|统一.*材料',part))
         preset=material(part)
-        material_text=bool(re.search(r'材料|密度|比热|导热系数|热导率|膨胀系数|相变|起熔|熔点|潜热',part))
+        material_text=bool(re.search(r'材料|密度|比热|导热系数|热导率|膨胀系数|相变|起熔|熔点|潜热|弹性模量|杨氏模量|泊松比|强度|物性|玻璃化|\bTg\b',part,re.I))
         if component and (material_text or preset):
             index=int(component.group(1))-1
             if index not in {r['component_id'] for r in model.get('components',[])}:
@@ -120,9 +134,23 @@ def update_materials(prompt, cfg, model, questions):
         if re.search(r'自定义材料',part): active['name']='自定义材料'
         title=re.search(r'(?:材料名称|命名为|名称设为)'+SET+r'[“"]([^”"]+)[”"]',part)
         if title: active['name']=title.group(1)
+        category=re.search(r'材料类别'+SET+r'(金属|高分子|玻璃|陶瓷|弹性体|复合材料|其他)',part)
+        if category:
+            active['category']={'金属':'metal','高分子':'polymer','玻璃':'glass','陶瓷':'ceramic','弹性体':'elastomer','复合材料':'composite','其他':'other'}[category.group(1)]
+            if active['category'] in ('glass','ceramic'): active['strength_criterion']='principal'
+        criterion=re.search(r'强度判据'+SET+r'(主应力|von_mises|von\s*Mises|屈服|不评估|none|principal)',part,re.I)
+        if criterion: active['strength_criterion']='principal' if criterion.group(1).lower() in ('主应力','principal') else 'none' if criterion.group(1).lower() in ('不评估','none') else 'von_mises'
+        for key,alias in [('data_source','材料数据来源'),('property_notes','物性说明')]:
+            match=re.search(alias+SET+r'[“"]([^”"]+)[”"]',part)
+            if match: active[key]=match.group(1)
         for key,(alias,kind) in MATERIAL_FIELDS.items():
+            if key not in ('k','rho','cp','thermal_expansion_CTE_per_K') and re.search(r'(?:清除|清空|取消)(?:'+alias+')',part,re.I):
+                active[key]=None;continue
             number=value(part,alias,kind)
-            if number is not None: active[key]=number
+            if number is not None:
+                if active.get('data_source') and active.get(key)!=number and '已按对话修改' not in active.get('property_notes',''):
+                    active['property_notes']='已按对话修改部分物性；来源指原始参考资料，当前输入不再等同原表数据。'+active.get('property_notes','')
+                active[key]=number
         phase_flag=_flag(part,r'相变')
         if phase_flag is not None: phase_requested[id(active)]=(active,phase_flag)
         if phase_flag is False:
@@ -150,6 +178,7 @@ def update_parameters(engine, model_id, prompt, cfg, questions):
         (r'CFD|流场|流速|压力场','当前三维求解器不求解流场；空气间隙导热不能代替 CFD。'),
         (r'各向异性|(?:随|依赖|相关).*温度.*(?:导热|物性)|温度相关物性','当前材料参数只支持常数各向同性物性及指定相变模型。'),
         (r'视角因子|视因子','当前辐射模型没有表面对表面的视角因子参数。')]
+    unsupported.append((r'塑性(?:变形|分析|求解)|蠕变|疲劳寿命|机械接触|摩擦接触', '当前热弹性模型只支持小变形线弹性与固定支撑，不能计算塑性、蠕变、疲劳寿命或机械接触。'))
     for part in clauses(prompt):
         for pattern,message in unsupported:
             match=re.search(pattern,part,re.I)
@@ -180,6 +209,8 @@ def update_parameters(engine, model_id, prompt, cfg, questions):
                 active_cooling=dict(name=selected['name']+'散热',faces=selected['faces'],h=cfg.get('default_h',10),
                     ambient_C=cfg.get('ambient_C',25),radiation=cfg.get('radiation_enabled',False),emissivity=cfg.get('emissivity',.8))
                 cooling.append(active_cooling)
+            from scenario_cases import box_from_text
+            active_cooling['surface_box']=box_from_text(part)
         elif global_scope or not is_boundary:
             active_cooling=None
         if active_cooling is not None and is_boundary:
@@ -223,9 +254,10 @@ def update_parameters(engine, model_id, prompt, cfg, questions):
         if title: cfg['name']=title.group(1)
 
 
-CONTROL_FIELDS = {'target_C':(r'目标温度|设定温度','temperature'),
-    'hysteresis_C':(r'(?:温控)?滞回(?:温差)?','difference'),
-    'min_power_W':(r'(?:最小|最低)功率','power'), 'max_power_W':(r'(?:最大|最高)功率','power')}
+CONTROL_FIELDS = {'target_C':(r'目标温度|设定温度|\btarget_C\b','temperature'),
+    'hysteresis_C':(r'(?:温控)?(?:滞回|回差)(?:温差)?|\bhysteresis_C\b','difference'),
+    'min_power_W':(r'(?:最小|最低)功率|\bmin_power_W\b','power'), 'max_power_W':(r'(?:最大|最高)功率|\bmax_power_W\b','power')}
+CONTROL_TERMS = r'温控|目标温度|设定温度|滞回|回差|最[大小高低]功率|\b(?:thermostat|target_C|hysteresis_C|min_power_W|max_power_W)\b'
 
 
 def heat_only_text(prompt):
@@ -233,7 +265,7 @@ def heat_only_text(prompt):
     from agent_rules import clauses
     kept=[];advanced=False
     for part in clauses(prompt):
-        if re.search(r'功率曲线|温控|目标温度|滞回|最大功率|最小功率|最高功率|最低功率',part): advanced=True;continue
+        if re.search(r'功率曲线|'+CONTROL_TERMS,part,re.I): advanced=True;continue
         if advanced and (CURVE_POINT.search(part) or re.search(r'目标温度|滞回|功率上限|功率下限',part)): continue
         advanced=False
         kept.append(part)
@@ -242,6 +274,8 @@ def heat_only_text(prompt):
 
 def update_heat_controls(prompt,cfg,questions):
     from agent_rules import clauses, ORDINALS, seconds
+    # Accept quoted schema keys copied from a thermostat JSON example.
+    prompt=re.sub(r'["\x27`]\s*('+ '|'.join(CONTROL_FIELDS) +r')\s*["\x27`]',r'\1',prompt,flags=re.I)
     target=None;mode=None;requested={}
     for part in clauses(prompt):
         if re.search(KEEP+r'|保留.*(?:温控|功率曲线)',part): continue
@@ -250,7 +284,7 @@ def update_heat_controls(prompt,cfg,questions):
             token=ordinal.group(1);target=int(token)-1 if token.isdigit() else ORDINALS.get(token,-1);mode=None
         named=next((i for i,h in enumerate(cfg['heat_sources']) if h.get('name') and ('“'+h['name']+'”' in part or '"'+h['name']+'"' in part)),None)
         if named is not None: target=named;mode=None
-        kind='power_profile' if '功率曲线' in part else 'thermostat' if re.search(r'温控|目标温度|滞回|最[大小高低]功率',part) else None
+        kind='power_profile' if '功率曲线' in part else 'thermostat' if re.search(CONTROL_TERMS,part,re.I) else None
         if kind:
             mode=kind
             if target is None:

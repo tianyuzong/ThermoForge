@@ -13,6 +13,8 @@ TIME_UNIT = r'小时|分钟|秒|min|h|s'
 POWER = re.compile(r'(?<![\d.eE])(?P<value>' + NUMBER + r')\s*(?P<unit>kW|千瓦|W|瓦)(?![A-Za-z])(?!(?:\s*[/／]))', re.I)
 MATERIALS = [('不锈钢|stainless', 4), ('碳钢|steel', 3),
              ('铝|aluminium|aluminum', 1), ('铜|copper', 0), ('铁|iron', 2)]
+from material_catalog import NONMETAL_ALIASES
+MATERIALS = [(pattern,index+5) for pattern,index in NONMETAL_ALIASES] + MATERIALS
 ORDINALS = {value:index for index,value in enumerate(('一','二','三','四','五','六','七','八','九','十','十一','十二','十三','十四','十五','十六'))}
 COMMAND = re.compile(r'不(?:再)?(?:启用|开启|使用|考虑)|不要|关闭|禁用|取消|启用|开启|打开|使用|考虑')
 
@@ -43,7 +45,13 @@ def time_window(text):
 
 
 def clauses(text):
-    return [part.strip() for part in re.split(r'[，,。;；\n]+', text) if part.strip()]
+    from scenario_cases import BOX
+    boxes=[]
+    def protect(match):
+        boxes.append(match.group());return f'§BOX{len(boxes)-1}§'
+    protected=BOX.sub(protect,text)
+    return [re.sub(r'§BOX(\d+)§',lambda m:boxes[int(m[1])],part.strip())
+            for part in re.split(r'[，,。;；\n]+',protected) if part.strip()]
 
 
 def heat_context(text):
@@ -51,7 +59,7 @@ def heat_context(text):
     text = re.sub(r'(?:并且|同时|并|而)(?=[^，,。;；\n]{0,30}(?:对流|散热|换热系数))', '；', text)
     from agent_config_rules import heat_only_text
     return '，'.join(part for part in clauses(heat_only_text(text))
-                    if not re.search(r'对流|散热|换热系数|环境温度|辐射', part)
+                    if not re.search(r'算例名称|评估接触面|接触面温度限值|接触面翘曲限值|热阻参考功率|从算例|对流|散热|换热系数|环境温度|辐射|固定|支撑|热应力|热弹性|位移限值|允许最大位移|纯环境|无热源', part)
                     and not (re.search(r'(?:组件|部件)\s*\d+', part)
                              and material(part) and not POWER.search(part)))
 
@@ -90,8 +98,12 @@ def make_plan(engine, model_id, prompt, current):
 
     from agent_config_rules import update_heat_controls
     update_heat_controls(prompt, cfg, questions)
+    from agent_structural import update_structural
+    update_structural(engine, model_id, prompt, cfg, questions)
+    from scenario_cases import update_case_parameters
+    update_case_parameters(engine, model_id, prompt, cfg, questions)
 
-    if not sources:
+    if not cfg['heat_sources'] and not cfg.get('environment_only'):
         questions.append('草案缺少热源：请指定功率与受热面，或点热源位置。')
     if cfg.get('mesh_size_m', .035) < max(model['dimensions_m']) / 130:
         warnings.append('已保留指定网格尺寸；较细网格可能增加计算时间和内存。')

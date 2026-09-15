@@ -10,6 +10,9 @@ rtree==1.4.1
 h5py>=3.12,<4
 meshio==5.3.5
 reportlab>=4.2,<5
+matplotlib>=3.9,<4
+playwright>=1.55,<2
+imageio-ffmpeg>=0.6,<1
 # CUDA 12 runtime bindings for the GPU sparse solver. Use THERMAL_DEVICE=auto for CPU fallback.
 cupy-cuda12x>=14,<15
 cutensor-cu12>=2.8,<3

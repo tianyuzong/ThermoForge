@@ -10,6 +10,7 @@ from schemas import Simulation, PRESETS, CalibrationRequest, RefrigerationCycle,
 from analysis import run_calibration, run_cycle, run_cpu
 from agent import codex_plan_request, plan_request
 from solver import gpu_status
+from compute_policy import execution_policy,can_admit_job,worker_environment
 
 app=FastAPI(title='Thermal Studio Local',version='0.1.0')
 app.add_middleware(GZipMiddleware,minimum_size=2000)
@@ -34,6 +35,9 @@ def status(folder):
     value=read_json(folder/'status.json') if (folder/'status.json').exists() else dict(phase='pending',progress=0,detail='等待处理')
     key=folder.name
     process=processes.get(key)
+    if process and process.poll() is None and value.get('phase')=='failed' and value.get('detail')=='上次运行被中断，请重新运行':
+        # An older local viewer may incorrectly mark another server's live job interrupted.
+        progress(folder,'running',value.get('progress',0),'计算进程仍在运行，等待下一次进度更新');value=read_json(folder/'status.json')
     if process and process.poll() is not None and value['phase'] in ('pending','running'):
         progress(folder,'failed',0,'计算进程已结束，详情见本地 worker.log');value=read_json(folder/'status.json')
     elif not process and value['phase'] in ('pending','running'):
@@ -46,6 +50,7 @@ def spawn(kind,id):
     log=(folder/'worker.log').open('wb')
     try:
         proc=subprocess.Popen([sys.executable,str(ROOT/'worker.py'),kind,id],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,
+            env=worker_environment() if kind=='solve' else None,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
     finally:log.close()
     processes[id]=proc
@@ -53,13 +58,15 @@ def spawn(kind,id):
 def validate_geometry(cfg):
     folder=located(MODELS,cfg.model_id);meta=read_json(folder/'metadata.json')
     if meta.get('state')!='ready':raise HTTPException(409,'几何尚未准备完成')
-    for group in [*cfg.heat_sources,*cfg.cooling]:
+    for group in [*cfg.heat_sources,*cfg.cooling,*(cfg.structural.supports if cfg.structural else []),*([cfg.surface_evaluation] if cfg.surface_evaluation else [])]:
         if group.faces and max(group.faces)>=meta['triangles']:raise HTTPException(422,'面选区不属于当前模型，请重新选取')
     if max(meta['dimensions_m'])/cfg.mesh_size_m>130:raise HTTPException(422,'网格尺寸不得小于最长边的 1/130')
     return folder
 
 @app.get('/api/health')
-def health():return dict(ok=True,app='Thermal Studio Local',version='0.1.0',pid=os.getpid(),compute=gpu_status())
+def health():return dict(ok=True,app='Thermal Studio Local',version='0.1.0',pid=os.getpid(),compute=gpu_status(),
+                         execution={**execution_policy(), 'transient_compute':gpu_status('transient'),
+                                    'structural_device':'cpu'})
 
 @app.post('/api/analysis/calibrate')
 def calibrate(request:CalibrationRequest):
@@ -142,12 +149,12 @@ def project(id:str):
 @app.post('/api/jobs',status_code=202)
 def run(cfg:Simulation):
     folder=validate_geometry(cfg)
-    if not cfg.heat_sources:
+    if not cfg.heat_sources and not cfg.environment_only:
         raise HTTPException(422,'请先添加至少一个热源并选择受热面或点位置，再运行仿真')
     if not read_json(folder/'metadata.json').get('mesh_ready'):raise HTTPException(422,'STL 尚未封闭，请修复后导入，或改用 STEP')
     with process_lock:
-        for id,process in processes.items():
-            if (JOBS/id).exists() and process.poll() is None:raise HTTPException(409,'已有算例正在计算，请等待完成或先取消')
+        active=sum((JOBS/id).exists() and process.poll() is None for id,process in processes.items())
+        if not can_admit_job(active):raise HTTPException(409,'已有算例正在计算，等待并行槽位或可用内存')
         id=uuid.uuid4().hex;job=JOBS/id;job.mkdir();write_json(job/'config.json',cfg.model_dump());progress(job,'pending',0,'准备启动');spawn('solve',id)
     return dict(id=id)
 
@@ -185,16 +192,113 @@ def slice_file(id:str,key:str,name:str):
 @app.get('/api/jobs/{id}/files/{name}')
 def download(id:str,name:str):
     folder=located(JOBS,id)
-    if name not in ('surface.bin','displacement.bin','config.json','history.csv','audit.json','report.md','report.pdf','result.zip'):raise HTTPException(404)
-    if name=='report.pdf' and (folder/'report.md').exists():
-        # Regenerate on download so reports created by older renderers are
-        # upgraded automatically and always reflect the current Markdown.
-        from solver import write_report_pdf
-        write_report_pdf(folder/'report.pdf',(folder/'report.md').read_text(encoding='utf-8'))
-    elif not (folder/name).exists():
-        raise HTTPException(404,'文件尚未生成')
+    if name not in ('surface.bin','displacement.bin','surface-displacement.bin','surface-von-mises.bin','stress.bin','assessment.json','config.json','history.csv','audit.json','report.md','report.pdf','result.zip'):raise HTTPException(404)
+    if name in ('report.pdf','report.md','result.zip') and (folder/'report.md').exists():
+        from engineering_report import ensure_current_report
+        ensure_current_report(folder)
+    if not (folder/name).exists():raise HTTPException(404,'文件尚未生成')
     media_type='application/pdf' if name=='report.pdf' else None
     return FileResponse(folder/name,filename=None if name=='surface.bin' else name,media_type=media_type)
+
+import thermal_animation
+
+def animation_action(id,action):
+    job=located(JOBS,id)
+    if status(job)['phase']!='completed':raise HTTPException(409,'请等待仿真计算完成后再查看热扩散动画')
+    try:return action(job)
+    except (ValueError,KeyError,FileNotFoundError) as error:raise HTTPException(422,str(error)) from error
+    except RuntimeError as error:raise HTTPException(409,str(error)) from error
+
+@app.get('/api/jobs/{id}/animation')
+def animation_manifest(id:str):
+    def prepare(job):
+        path=thermal_animation.prepare_preview(job)
+        return read_json(path.parent/'manifest.json')
+    return animation_action(id,prepare)
+
+@app.get('/api/jobs/{id}/animation/view')
+def animation_view(id:str):
+    path=animation_action(id,thermal_animation.prepare_preview)
+    return FileResponse(path,media_type='text/html')
+
+@app.get('/api/jobs/{id}/animation/html')
+def animation_html(id:str):
+    path=animation_action(id,thermal_animation.prepare_preview)
+    return FileResponse(path,media_type='text/html',filename='thermal-animation.html')
+
+@app.get('/api/jobs/{id}/animation/status')
+def animation_status(id:str):return animation_action(id,thermal_animation.export_status)
+
+@app.post('/api/jobs/{id}/animation/video',status_code=202)
+def animation_export(id:str):return animation_action(id,thermal_animation.start_export)
+
+@app.get('/api/jobs/{id}/animation/video')
+def animation_video(id:str):
+    state=animation_action(id,thermal_animation.export_status)
+    if state['phase']!='completed':raise HTTPException(409,'MP4视频尚未生成，请先导出')
+    return FileResponse(located(JOBS,id)/'thermal-animation/animation.mp4',media_type='video/mp4',filename='thermal-animation.mp4')
+
+from workflow_agent import WorkflowRequest
+import workflows
+
+@app.get('/api/capabilities')
+def host_capabilities():
+    from host_geometry import capabilities
+    return capabilities()
+
+@app.get('/api/models/{id}/preflight')
+def geometry_preflight(id:str):
+    from host_geometry import model_evidence
+    return model_evidence(located(MODELS,id))
+
+@app.post('/api/workflows/plan',status_code=202)
+def plan_workflow(request:WorkflowRequest):
+    located(MODELS,request.model_id)
+    try:return workflows.create(request)
+    except (ValueError,OSError) as error:raise HTTPException(422,str(error))
+
+@app.get('/api/workflows')
+def list_workflows():
+    if not workflows.WORKFLOWS.exists():return []
+    values=[]
+    for p in workflows.WORKFLOWS.iterdir():
+        if (p/'workflow.json').is_file():
+            w=workflows.get(p.name)
+            values.append({k:w.get(k) for k in ('id','name','model_id','phase','updated_at','detail')})
+    return sorted(values,key=lambda w:w['updated_at'],reverse=True)
+
+@app.get('/api/workflows/{id}')
+def workflow_state(id:str):
+    try:return workflows.get(id)
+    except ValueError as error:raise HTTPException(404,str(error))
+
+@app.post('/api/workflows/{id}/start',status_code=202)
+def start_workflow(id:str):
+    try:return workflows.start(id,run,job_status,cancel)
+    except ValueError as error:raise HTTPException(409,str(error))
+
+@app.post('/api/workflows/{id}/cancel')
+def cancel_workflow(id:str):
+    try:return workflows.cancel(id)
+    except ValueError as error:raise HTTPException(404,str(error))
+
+@app.post('/api/workflows/{id}/retry-plan',status_code=202)
+def retry_workflow_plan(id:str):
+    try:return workflows.retry_plan(id)
+    except ValueError as error:raise HTTPException(409,str(error))
+
+@app.post('/api/workflows/{id}/recheck',status_code=202)
+def recheck_workflow_plan(id:str):
+    try:return workflows.retry_plan(id,recheck=True)
+    except ValueError as error:raise HTTPException(409,str(error))
+
+@app.get('/api/workflows/{id}/files/{name}')
+def workflow_file(id:str,name:str):
+    if name not in ('workflow.json','report.md','report.pdf','comparison.json','comparison.csv','manifest.json','reports.zip'):raise HTTPException(404)
+    try:p=workflows.folder(id)/name
+    except ValueError as error:raise HTTPException(404,str(error))
+    if not p.is_file():raise HTTPException(404,'文件尚未生成')
+    return FileResponse(p,filename=name,media_type='application/pdf' if name.endswith('.pdf') else None)
 
 app.mount('/',StaticFiles(directory=ROOT/'static',html=True),name='ui')
 

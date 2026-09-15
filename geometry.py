@@ -271,7 +271,9 @@ def build_mesh(folder, cfg, job):
         # topology. Merge those nodes so heat can cross a touching interface.
         try: gmsh.model.mesh.removeDuplicateNodes()
         except Exception: pass
-        gmsh.model.mesh.optimize('Netgen')
+        # Gmsh's native tetrahedral optimizer avoids the Windows Netgen DLL
+        # access violation observed on the validated heatsink STL.
+        gmsh.model.mesh.optimize('')
         tags,xyz,_=gmsh.model.mesh.getNodes();points=np.asarray(xyz).reshape(-1,3)
         lookup=np.full(int(max(tags))+1,-1,dtype=np.int64);lookup[tags]=np.arange(len(tags))
         types,ids,nodes=gmsh.model.mesh.getElements(3)
