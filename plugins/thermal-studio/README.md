@@ -38,7 +38,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Stop.ps1 -Port 8765
 插件目录独立放置时，设置完整工程路径，并切换到该目录后再调用插件启动脚本：
 
 ```powershell
-$env:THERMAL_STUDIO_ROOT = 'D:\path\to\hot_sim_new'
+$env:THERMAL_STUDIO_ROOT = 'D:\path\to\ThermoForge'
 Set-Location -LiteralPath $env:THERMAL_STUDIO_ROOT
 ```
 

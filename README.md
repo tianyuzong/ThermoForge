@@ -1,6 +1,8 @@
-<h1><img src="static/thermal-studio-logo.png" height="40" alt="Thermal Studio logo" style="vertical-align: middle;"> Thermal Studio</h1>
+<h1><img src="static/thermal-studio-logo.png" height="40" alt="Thermal Studio logo" style="vertical-align: middle;"> ThermoForge</h1>
 
-**Thermal Studio 是一个由 Agent 辅助配置与规划的本地三维热仿真及热结构分析平台，面向实物加工、打样前的热设计评估。** 导入 STL / STEP 数字模型后，可以预测温度分布、热变形与热应力，提前识别局部过热、温度不均和安装面翘曲等问题，为结构、材料及散热方案的调整提供计算依据。
+**ThermoForge 是一个由 Agent 辅助配置与规划的本地三维热仿真及热结构分析平台，面向实物加工、打样前的热设计评估。** 导入 STL / STEP 数字模型后，可以预测温度分布、热变形与热应力，提前识别局部过热、温度不均和安装面翘曲等问题，为结构、材料及散热方案的调整提供计算依据。
+
+本地应用与 Codex 插件以 **Thermal Studio** 名称提供。
 
 通过自然语言描述工业场景、工作条件和设计目标，Agent 会拆分工况、补充必要信息，并生成可检查、经宿主校验的配置。用户整体确认后，平台按依赖关系执行计算、继承完整温度场、复用通过校核的已有结果，并汇总分析报告。例如，功率模块散热安装座可以依次评估正常风冷、停风后的温升，以及独立的高低温环境循环。
 
@@ -118,8 +120,8 @@
 准备 Python 3.11 或更新版本，以及支持 WebGL 的浏览器。使用 Git 获取源码后，在 **仓库根目录**运行以下命令：
 
 ```powershell
-git clone https://github.com/tianyuzong/hot_sim_new.git
-cd hot_sim_new
+git clone https://github.com/tianyuzong/ThermoForge.git
+cd ThermoForge
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Start.ps1 -Device auto
 ```
